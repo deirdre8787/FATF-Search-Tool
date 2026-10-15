@@ -1,0 +1,5 @@
+Put the TWO round-4 CSVs in this folder:
+  - the file whose name contains  RC_IO  (or KFRA)     -> Effectiveness + Risk and Context
+  - the file whose name contains  TECH_COMP (or TCOMP) -> Technical Compliance
+The tool finds them by those keywords, so the date-stamps in the file names
+do not matter. You can delete this text file.

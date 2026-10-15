@@ -1,0 +1,4 @@
+Drop Word (.docx), PDF, Excel (.xlsx), .csv or .txt files here for
+"Other files" mode. Everything in them is searched, and every hit says
+exactly where it was found (section, table cell, sheet and cell, or page).
+You can delete this text file.

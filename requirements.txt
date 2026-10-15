@@ -1,0 +1,7 @@
+flask>=2.2
+pandas>=1.5
+openpyxl>=3.1
+# optional: faster fuzzy matching
+rapidfuzz
+# optional: needed only to search PDFs in Other files mode
+pypdf

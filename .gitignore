@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# your own data and outputs stay on your computer
+source files/**/*.csv
+source files/other/*
+!source files/other/PUT OTHER FILES HERE.txt
+exports/*
+!exports/EXPORTS_SAVED_HERE.txt
+
+# Office lock files
+~$*
