@@ -1,11 +1,43 @@
-MER SEARCH TOOL  -  v8 (30 Sep 2026)
+MER SEARCH TOOL  -  v9 (15 Oct 2026)
 ====================================
 Search FATF Mutual Evaluation Reports (4th round, 5th round, or both
 together) and other documents, then export the results to Excel and Word.
 
-CHECK YOU ARE ON v8: the header in the browser says "v8 (30 Sep 2026)".
+CHECK YOU ARE ON v9: the header in the browser says "v9 (15 Oct 2026)".
 If it doesn't, close every black console window, run the .bat again and
 press Ctrl+F5 in the browser.
+
+
+WHAT IS NEW IN v9
+-----------------
+* PARAGRAPHS KEEP THEIR FORMATTING. The MER data arrives as HTML. The tool
+  used to throw the formatting away; it now keeps a safe copy of it.
+  "Read paragraph" under each hit opens the full paragraph as it looks in
+  the report: tables as tables, the shaded "Box" case studies as boxes,
+  lists, bold, italics and footnote marks, with the matched words
+  highlighted. Hits containing a table, box or list are labelled.
+  The search itself still runs on the plain text, so hit counts are
+  exactly the same as in v8. Exports are unchanged (plain-text quotes).
+  HTML in your own CSV / Excel cells (Other files) is shown the same way.
+
+* NEW FILTER PANEL. Each filter (jurisdictions, sections, ratings,
+  criterion ratings) is now a checklist instead of a Ctrl+click list:
+    - a search box, plus All / None for whatever is shown;
+    - a tick box on every group, to select a whole section at once:
+      all FATF members, all of Effectiveness, all of IO.6, all of R.20,
+      all effectiveness ratings, and so on;
+    - "Expand" opens the filters in a large window, with a full-screen
+      option, Invert, "show selected only" and quick picks such as
+      "Assessed in both rounds";
+    - "Search again with these filters" re-runs the last search.
+  Everything starts ticked (= no filter). If you untick everything in a
+  filter, the tool asks you to tick at least one before searching.
+
+* NEW LOOK, with a dark mode that follows your computer's setting until
+  you choose one.
+
+* The first load of each round after updating takes the usual 20 to 60
+  seconds once, because the cache is rebuilt to hold the formatting.
 
 
 WHAT IS NEW IN v8

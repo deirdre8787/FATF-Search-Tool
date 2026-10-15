@@ -1,5 +1,5 @@
 """
-FATF Mutual Evaluation Search Tool  (v8)
+FATF Mutual Evaluation Search Tool  (v9)
 ========================================
 Local web app. Run:  python app.py   (or double-click run_search_tool.bat)
 Opens automatically in your browser at http://127.0.0.1:5177
@@ -29,6 +29,7 @@ from collections import Counter, defaultdict, OrderedDict
 from copy import copy
 from datetime import datetime
 from html import escape as html_escape
+from html.parser import HTMLParser
 
 import pandas as pd
 from flask import Flask, request, jsonify, Response
@@ -66,7 +67,7 @@ ROUND5_DIR  = os.path.join(MER_DIR, "round_5")
 OTHER_DIR   = os.path.join(BASE_DIR, "source files", "other")
 DEFAULT_EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 
-VERSION = "v8  (30 Sep 2026)"
+VERSION = "v9  (15 Oct 2026)"
 
 CONTEXT_CHARS = 250          # characters before/after detected term
 PAGE_SIZE     = 25           # rows fetched per "show more" click in the browser
@@ -130,6 +131,143 @@ def strip_html(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+# The OECD CSVs carry each paragraph as HTML (paragraphs, lists, tables and
+# the shaded "Box" case studies). The search runs on the plain text above, so
+# counts never change; this keeps a safe copy of the formatting so the browser
+# can show the paragraph as it appears in the report.
+_KEEP_TAGS = {"p", "br", "b", "strong", "i", "em", "u", "s", "sub", "sup",
+              "ul", "ol", "li", "table", "thead", "tbody", "tfoot", "tr", "th",
+              "td", "caption", "colgroup", "col", "div", "span", "blockquote",
+              "hr", "h1", "h2", "h3", "h4", "h5", "h6", "a", "dl", "dt", "dd"}
+_VOID_TAGS = {"br", "hr", "col"}
+_DROP_WITH_CONTENT = {"script", "style", "iframe", "object", "embed", "noscript",
+                      "template", "svg", "math", "head", "title"}
+_KEEP_STYLE = {"text-align", "vertical-align", "font-weight", "font-style",
+               "text-decoration", "list-style-type", "padding-left", "margin-left"}
+_SAFE_STYLE_VALUE = re.compile(r"^[#%.,\w\s-]{1,40}$")
+_BLOCK_CLOSES_P = (({"p"}, {"td", "th", "li", "div", "blockquote", "dd"}),)
+# tag -> ((tags it closes, tags that stop the search), ...)
+_IMPLIED_CLOSE = {
+    "td": (({"td", "th"}, {"table", "tr"}),),
+    "th": (({"td", "th"}, {"table", "tr"}),),
+    "tr": (({"tr"}, {"table"}),),
+    "thead": (({"tr", "thead", "tbody", "tfoot"}, {"table"}),),
+    "tbody": (({"tr", "thead", "tbody", "tfoot"}, {"table"}),),
+    "tfoot": (({"tr", "thead", "tbody", "tfoot"}, {"table"}),),
+    "li": (({"li"}, {"ul", "ol"}),),
+    "dt": (({"dt", "dd"}, {"dl"}),),
+    "dd": (({"dt", "dd"}, {"dl"}),),
+}
+for _t in ("p", "table", "ul", "ol", "div", "blockquote", "h1", "h2", "h3", "h4",
+           "h5", "h6", "hr", "dl"):
+    _IMPLIED_CLOSE[_t] = _IMPLIED_CLOSE.get(_t, ()) + _BLOCK_CLOSES_P
+_HEADING_TAGS = {"h1": "h4", "h2": "h4", "h3": "h5", "h4": "h5", "h5": "h6", "h6": "h6"}
+
+class _Sanitiser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out, self.stack, self.skip = [], [], 0
+
+    def _attrs(self, tag, attrs):
+        keep, classes, styles = [], [], []
+        a = {k.lower(): (v or "") for k, v in attrs}
+        for k in ("colspan", "rowspan"):
+            if a.get(k, "").strip().isdigit() and tag in ("td", "th"):
+                keep.append(f'{k}="{int(a[k]) if int(a[k]) < 100 else 99}"')
+        if tag == "a":
+            href = a.get("href", "").strip()
+            if re.match(r"^https?://", href, re.I):
+                keep.append(f'href="{html_escape(href, quote=True)}" target="_blank" rel="noopener noreferrer"')
+        if a.get("align", "").lower() in ("left", "right", "center", "justify"):
+            styles.append(f"text-align:{a['align'].lower()}")
+        if a.get("valign", "").lower() in ("top", "middle", "bottom"):
+            styles.append(f"vertical-align:{a['valign'].lower()}")
+        if a.get("bgcolor"):
+            classes.append("shaded")
+        for decl in a.get("style", "").split(";"):
+            if ":" not in decl:
+                continue
+            prop, val = (x.strip().lower() for x in decl.split(":", 1))
+            if prop.startswith("background") and val not in ("", "none", "transparent", "#fff", "#ffffff", "white"):
+                classes.append("shaded")
+            elif re.match(r"^border(-(top|right|bottom|left))?$", prop) \
+                    and tag in ("div", "p", "blockquote") \
+                    and not re.search(r"\bnone\b|^0", val):
+                classes.append("boxed")
+            elif prop in _KEEP_STYLE and _SAFE_STYLE_VALUE.match(val):
+                styles.append(f"{prop}:{val}")
+        if classes:
+            keep.append('class="%s"' % " ".join(sorted(set(classes))))
+        if styles:
+            keep.append('style="%s"' % html_escape(";".join(styles), quote=True))
+        return (" " + " ".join(keep)) if keep else ""
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in _DROP_WITH_CONTENT:
+            self.skip += 1
+            return
+        if self.skip or tag not in _KEEP_TAGS:
+            return
+        out_tag = _HEADING_TAGS.get(tag, tag)
+        for closes, stops in _IMPLIED_CLOSE.get(tag, ()):
+            self._close_implied(closes, stops)
+        self.out.append(f"<{out_tag}{self._attrs(tag, attrs)}>")
+        if tag not in _VOID_TAGS:
+            self.stack.append(out_tag)
+
+    def _close_implied(self, closes, stops):
+        """'<td>a<td>b' means two cells, not one inside the other."""
+        for i in range(len(self.stack) - 1, -1, -1):
+            t = self.stack[i]
+            if t in stops:
+                return
+            if t in closes:
+                while len(self.stack) > i:
+                    self.out.append(f"</{self.stack.pop()}>")
+                return
+
+    def handle_startendtag(self, tag, attrs):
+        if tag.lower() in _VOID_TAGS:
+            self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in _DROP_WITH_CONTENT:
+            self.skip = max(0, self.skip - 1)
+            return
+        if self.skip or tag not in _KEEP_TAGS or tag in _VOID_TAGS:
+            return
+        out_tag = _HEADING_TAGS.get(tag, tag)
+        if out_tag in self.stack:              # close anything left open inside it
+            while self.stack:
+                t = self.stack.pop()
+                self.out.append(f"</{t}>")
+                if t == out_tag:
+                    break
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(html_escape(ILLEGAL_XLSX.sub("", data), quote=False))
+
+def sanitize_html(text):
+    """Safe, display-only copy of a paragraph's HTML. Returns "" when the
+       text has no markup, so the browser simply shows the plain text."""
+    if pd.isna(text):
+        return ""
+    text = str(text)
+    if "<" not in text or not re.search(r"<\s*/?\s*[a-zA-Z]", text):
+        return ""
+    try:
+        p = _Sanitiser()
+        p.feed(text)
+        p.close()
+        p.out.extend(f"</{t}>" for t in reversed(p.stack))
+        html = "".join(p.out).strip()
+    except Exception:
+        return ""
+    return html if re.search(r"<[a-z]", html) else ""
+
 def combine_rating(code, label):
     """Return the SHORT code only: 'LC' + 'Largely compliant' -> 'LC'; '_Z' -> 'NA'."""
     code = "" if pd.isna(code) else str(code).strip()
@@ -157,7 +295,7 @@ def rating_option(code):
 # DATA LOADING (cached in memory, and on disk so restarts are fast)
 # =============================================================================
 _CACHE = {}   # keys: "mer4", "mer5", "merboth", "other"
-LOADER_VERSION = "8.0"
+LOADER_VERSION = "9.0"
 
 def _cache_dir():
     """Local (not synced) folder for the fast-restart cache."""
@@ -198,6 +336,7 @@ def _build_round(rn):
     kfra = pd.read_csv(kfra_path, encoding="utf-8-sig", dtype=str,
                        usecols=["Jurisdiction", "MEASURE", "Indicator",
                                 "EFF_CAT", "Effectiveness rating", "OBS_VALUE"])
+    kfra["OBS_HTML"] = kfra["OBS_VALUE"].apply(sanitize_html)
     kfra["OBS_VALUE"] = kfra["OBS_VALUE"].apply(strip_html)
     kfra = kfra[kfra["OBS_VALUE"] != ""].copy()
     register_labels(kfra["EFF_CAT"], kfra["Effectiveness rating"])
@@ -214,6 +353,7 @@ def _build_round(rn):
                               "COMP_RATING", "Technical compliance rating",
                               "CRIT_RATING", "Criteria rating", "OBS_VALUE"])
     tc = tc.rename(columns={"Criteria rating": "_crit_label"})
+    tc["OBS_HTML"] = tc["OBS_VALUE"].apply(sanitize_html)
     tc["OBS_VALUE"] = tc["OBS_VALUE"].apply(strip_html)
     tc = tc[tc["OBS_VALUE"] != ""].copy()
     register_labels(tc["COMP_RATING"], tc["Technical compliance rating"])
@@ -226,7 +366,8 @@ def _build_round(rn):
 
     kfra["Round"] = ROUND_LABEL[rn]
     tc["Round"] = ROUND_LABEL[rn]
-    df = pd.concat([kfra[UNIFORM_COLS], tc[UNIFORM_COLS]], ignore_index=True)
+    df = pd.concat([kfra[UNIFORM_COLS + ["OBS_HTML"]], tc[UNIFORM_COLS + ["OBS_HTML"]]],
+                   ignore_index=True)
     df = df.fillna("")
     # lower-case, accent-free copy of every paragraph: lets the search skip
     # paragraphs that cannot possibly match before running the full pattern
@@ -315,7 +456,8 @@ def _records_from_tabular(path, is_csv):
             continue
         header = [_clean(v) for v in d.iloc[0].tolist()]   # row 1, used as labels
         for ri in range(len(d)):
-            rowvals = [_clean(v) for v in d.iloc[ri].tolist()]
+            rawvals = d.iloc[ri].tolist()
+            rowvals = [_clean(v) for v in rawvals]
             details = " | ".join(f"{header[ci] or _xl_col(ci)}: {v}"
                                  for ci, v in enumerate(rowvals) if v)[:1200]
             for ci, val in enumerate(rowvals):
@@ -326,7 +468,11 @@ def _records_from_tabular(path, is_csv):
                 colname = header[ci] if ri > 0 and header[ci] else ""
                 if colname:
                     where += f" (column: {colname})"
-                recs.append({"Location": where, "Text": val, "Details": details})
+                rec = {"Location": where, "Text": val, "Details": details}
+                html = sanitize_html(rawvals[ci])
+                if html:
+                    rec["Html"] = html
+                recs.append(rec)
                 if len(recs) >= MAX_RECORDS_PER_FILE:
                     return recs, "file truncated at record cap"
     return recs, None
@@ -876,6 +1022,7 @@ def search_mer(df, tp, mode, threshold, filters):
         return []
     cols = {c: sub[c].tolist() for c in UNIFORM_COLS}
     texts = cols["OBS_VALUE"]
+    htmls = sub["OBS_HTML"].tolist() if "OBS_HTML" in sub.columns else [""] * len(texts)
     if mode in ("strict", "exact"):
         norms = sub["_norm"].tolist()
         groups = [g for g in tp["ptokens"] if g]
@@ -891,6 +1038,7 @@ def search_mer(df, tp, mode, threshold, filters):
             continue
         start, end, variants = hit
         r = {c: cols[c][i] for c in UNIFORM_COLS}
+        r["html"] = htmls[i]
         r["context"] = make_context(text, start, end)
         r["sentence"] = sentence_of(text, start, end)
         r["matched"] = variants[0]
@@ -962,6 +1110,7 @@ def search_other(datasets, tp, mode, threshold):
                 "Details": rec.get("Details", ""),
                 "Full text": text,
                 "context": make_context(text, start, end),
+                "html": rec.get("Html", ""),
                 "matched": variants[0],
                 "variants": variants,
                 "ref": f'{ds["file"]}, {rec["Location"]}',
@@ -1098,7 +1247,7 @@ def finalize(p, raw, excluded=None):
 def _slim_row(r):
     """What the browser needs for one hit."""
     keep = ("_id", "Round", "Jurisdiction", "Table", "MEASURE", "Indicator", "Rating",
-            "Criteria rating", "OBS_VALUE", "context", "sentence", "matched",
+            "Criteria rating", "OBS_VALUE", "html", "context", "sentence", "matched",
             "variants", "ref", "File", "Location", "Sentence with term", "Details",
             "Full text")
     return {k: r[k] for k in keep if k in r}
@@ -2023,6 +2172,98 @@ def build_word_report(p, blocks, export_dir):
 # =============================================================================
 # API ROUTES
 # =============================================================================
+# =============================================================================
+# FILTER PANEL DATA (groups for "select a whole section")
+# =============================================================================
+# FATF members with their own mutual evaluation (the European Commission and
+# the Gulf Co-operation Council are members but are not evaluated). Russia's
+# membership has been suspended since February 2023; it keeps its reports.
+FATF_MEMBERS = [
+    "Argentina", "Australia", "Austria", "Belgium", "Brazil", "Canada", "China",
+    "Denmark", "Finland", "France", "Germany", "Greece", "Hong Kong, China",
+    "Iceland", "India", "Indonesia", "Ireland", "Israel", "Italy", "Japan", "Korea",
+    "Luxembourg", "Malaysia", "Mexico", "Netherlands", "New Zealand", "Norway",
+    "Portugal", "Russian Federation", "Saudi Arabia", "Singapore", "South Africa",
+    "Spain", "Sweden", "Switzerland", "Türkiye", "United Kingdom", "United States",
+]
+
+def _jkey(name):
+    k = re.sub(r"[^a-z]", "", deaccent(str(name)).lower())
+    return {"hongkongchina": "hongkongchina", "hongkongsarchina": "hongkongchina",
+            "hongkong": "hongkongchina", "turkey": "turkiye", "republicofkorea": "korea",
+            "korearepublicof": "korea", "russia": "russianfederation",
+            "unitedstatesofamerica": "unitedstates", "thenetherlands": "netherlands",
+            "netherlandsthe": "netherlands", "kingdomofthenetherlands": "netherlands",
+            "kingdomofsaudiarabia": "saudiarabia", "peoplesrepublicofchina": "china"}.get(k, k)
+
+_FATF_KEYS = {_jkey(m) for m in FATF_MEMBERS}
+
+def jurisdiction_facet(df):
+    names = sorted(df["Jurisdiction"].unique().tolist())
+    members = [n for n in names if _jkey(n) in _FATF_KEYS]
+    others = [n for n in names if _jkey(n) not in _FATF_KEYS]
+    tree = [{"id": "fatf", "name": "FATF members", "items": members},
+            {"id": "other", "name": "Other jurisdictions (FSRB members)", "items": others}]
+    presets = []
+    rounds = df.groupby("Jurisdiction")["Round"].unique()
+    if df["Round"].nunique() == 2:
+        has = {j: set(r) for j, r in rounds.items()}
+        both = [j for j in names if len(has[j]) == 2]
+        only4 = [j for j in names if has[j] == {"4th round"}]
+        only5 = [j for j in names if has[j] == {"5th round"}]
+        presets = [p for p in (
+            {"name": "Assessed in both rounds", "items": both},
+            {"name": "4th round only", "items": only4},
+            {"name": "5th round only", "items": only5}) if p["items"]]
+    presets.append({"name": "FATF members", "items": members})
+    return {"tree": [t for t in tree if t["items"]], "presets": presets}
+
+def indicator_facet(df):
+    """Indicators grouped by table, then by IO / recommendation."""
+    u = df[df["Indicator"] != ""][["Table", "MEASURE", "Indicator"]].drop_duplicates()
+    tree = []
+    for tbl in TABLES:
+        part = u[u["Table"] == tbl]
+        if part.empty:
+            continue
+        by_group = defaultdict(set)
+        for m, ind in zip(part["MEASURE"].tolist(), part["Indicator"].tolist()):
+            by_group[pretty_measure(m) or "Other"].add(ind)
+        names = sorted(by_group, key=_measure_key)
+        groups = [{"id": f"{tbl}|{g}", "name": g,
+                   "items": sorted(by_group[g], key=_measure_key)} for g in names]
+        # one group, or groups of one indicator each, is just noise: flatten
+        if len(groups) == 1 or all(len(g["items"]) == 1 for g in groups):
+            tree.append({"id": tbl, "name": tbl,
+                         "items": sorted({i for g in groups for i in g["items"]},
+                                         key=_measure_key)})
+        else:
+            tree.append({"id": tbl, "name": tbl, "children": groups})
+    return {"tree": tree, "presets": []}
+
+_RATING_ORDER = ["HE", "SE", "ME", "LE", "C", "LC", "PC", "NC", "M", "MM", "PM", "NM", "NA"]
+
+def _rating_sort(c):
+    return (_RATING_ORDER.index(c) if c in _RATING_ORDER else 50, c)
+
+def rating_facet(df):
+    tree = []
+    eff = set(df.loc[df["Table"] == "Effectiveness", "Rating"]) - {"", "NA"}
+    tc = set(df.loc[df["Table"] == "Technical Compliance", "Rating"]) - {"", "NA"}
+    if eff:
+        tree.append({"id": "eff", "name": "Effectiveness ratings",
+                     "items": sorted(eff, key=_rating_sort)})
+    if tc - eff:
+        tree.append({"id": "tc", "name": "Technical compliance ratings",
+                     "items": sorted(tc - eff, key=_rating_sort)})
+    if (df["Rating"] == "NA").any():
+        tree.append({"id": "na", "name": "No rating (Risk and Context)", "items": ["NA"]})
+    return {"tree": tree, "presets": []}
+
+def crit_facet(df):
+    vals = sorted((x for x in df["Criteria rating"].unique().tolist() if x), key=_rating_sort)
+    return {"tree": [{"id": "all", "name": "", "items": vals}], "presets": []}
+
 def _err(e):
     return jsonify({"ok": False, "error": f"{e}", "trace": traceback.format_exc()})
 
@@ -2051,6 +2292,10 @@ def api_load():
                             for c in sorted(x for x in df["Rating"].unique().tolist() if x)],
                 "crit_ratings": [{"code": c, "label": rating_option(c)}
                                  for c in sorted(x for x in df["Criteria rating"].unique().tolist() if x)],
+                "facets": {"jur": jurisdiction_facet(df), "ind": indicator_facet(df),
+                           "rat": rating_facet(df), "crit": crit_facet(df)},
+                "labels": {c: rating_option(c) for c in
+                           set(df["Rating"].unique()) | set(df["Criteria rating"].unique()) if c},
             })
         ds = load_other()
         files = [{"file": d["file"],
@@ -2211,447 +2456,700 @@ def api_open_folder():
 # FRONT END (single page)
 # =============================================================================
 PAGE = r"""<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MER Search — FATF Mutual Evaluation Intelligence</title>
+<title>MER Search</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@600;700;800&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&family=DM+Mono:wght@400;500&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&display=swap" rel="stylesheet">
 <style>
+/* =====================================================================
+   Tokens
+   ===================================================================== */
 :root{
-  --canvas:#f1f5fa; --panel:#ffffff; --panel2:#f6f9fc;
-  --ink:#1e2f4d; --muted:#54677f; --faint:#8b9cb3;
-  --border:#dde6f0; --border2:#c9d7e6;
-  --accent:#2c5f8a; --accent-strong:#1f4a70; --accent-soft:#e3edf6;
-  --steel:#7fa6c9;
-  --mark:#fdf0b4; --mark-ink:#54470a;
-  --eff:#5b87b5; --eff-soft:#e4eef7;
-  --rc:#6fa88a;  --rc-soft:#e7f2ec;
-  --tc:#b39a63;  --tc-soft:#f5efe1;
-  --oth:#8b99ab; --oth-soft:#eef1f5;
-  --good:#4d8b6f; --good-soft:#e4f1ea;
-  --mid:#4a7cab;  --mid-soft:#e4edf6;
-  --warn:#a8873d; --warn-soft:#f7efdb;
-  --bad:#a85a68;  --bad-soft:#f6e7ea;
-  --na:#93a0b0;   --na-soft:#edf0f4;
-  --shadow:0 1px 2px rgba(30,47,77,.06),0 5px 16px rgba(30,47,77,.06);
-  --radius:12px;
+  --canvas:#f3ece3; --surface:#fbf8f4; --sunk:#f1e9df; --doc:#fdfbf8;
+  --glass:rgba(253,250,246,.62); --glass-edge:rgba(255,255,255,.85);
+  --ink:#1c1916; --muted:#6b625a; --faint:#9c9187;
+  --rule:#e6dcd0; --rule2:#d6c8b8;
+  --accent:#b4472c; --accent-strong:#933720; --accent-soft:#f5e3d9; --on-accent:#fdf8f3;
+  --mark:#f3cdb7; --mark-ink:#3a160a;
+  --box:#f4e8dd; --box-rule:#b4472c;
+  --eff:#4a6a86; --rc:#62805a; --tc:#b07a2e; --oth:#8a8077;
+  --good:#3f7a52; --good-soft:#e3efe2;
+  --mid:#3f6688;  --mid-soft:#e2eaf1;
+  --warn:#9a6a12; --warn-soft:#f7ebcf;
+  --bad:#a63a2a;  --bad-soft:#f6e0da;
+  --na:#8a8077;   --na-soft:#efe8e0;
+  --r4:#6a4c7c; --r4-soft:#eee4f1;
+  --r5:#2f6b66; --r5-soft:#dff0ec;
+  --lift:0 1px 1px rgba(60,35,20,.04),0 18px 40px -22px rgba(90,50,25,.28);
+  --sans:'Instrument Sans','Segoe UI',system-ui,sans-serif;
+  --display:'Instrument Serif','Didot','Bodoni MT',Georgia,serif;
+  --serif:'Source Serif 4',Georgia,'Times New Roman',serif;
+  --mono:'DM Mono',ui-monospace,Consolas,monospace;
+  color-scheme:light;
 }
 body.dark{
-  --canvas:#0d1725; --panel:#152238; --panel2:#1b2b44;
-  --ink:#e6edf6; --muted:#9db0c6; --faint:#6b7f97;
-  --border:#24334a; --border2:#31445f;
-  --accent:#6ea3d4; --accent-strong:#8db8e0; --accent-soft:#1c3350;
-  --steel:#6ea3d4;
-  --mark:#5d5013; --mark-ink:#fdf0b4;
-  --eff:#7fa9d4; --eff-soft:#1d2f47;
-  --rc:#83bd9e;  --rc-soft:#1a3229;
-  --tc:#cbb079;  --tc-soft:#37301c;
-  --oth:#9db0c6; --oth-soft:#20304a;
-  --good:#6cbf97; --good-soft:#183227;
-  --mid:#7fa9d4;  --mid-soft:#1d2f47;
-  --warn:#d4b25e; --warn-soft:#383018;
-  --bad:#d48a97;  --bad-soft:#3a2229;
-  --na:#7e8fa3;   --na-soft:#20304a;
-  --shadow:0 1px 2px rgba(0,0,0,.4),0 6px 18px rgba(0,0,0,.3);
+  --canvas:#1a1613; --surface:#231e1a; --sunk:#2b2520; --doc:#26201c;
+  --glass:rgba(38,32,28,.7); --glass-edge:rgba(255,240,225,.08);
+  --ink:#f1e8de; --muted:#b9ab9d; --faint:#85786c;
+  --rule:#3a312a; --rule2:#4a3f36;
+  --accent:#e2795a; --accent-strong:#f09a7e; --accent-soft:#3d241b; --on-accent:#1e0f09;
+  --mark:#7a3a22; --mark-ink:#ffe9dc;
+  --box:#33271f; --box-rule:#e2795a;
+  --eff:#8fb0cc; --rc:#9cbc92; --tc:#dcae66; --oth:#a99c90;
+  --good:#8cc79a; --good-soft:#1f3123;
+  --mid:#90b4d6;  --mid-soft:#1e2c39;
+  --warn:#e0b45c; --warn-soft:#382c14;
+  --bad:#ec8f7c;  --bad-soft:#3e211b;
+  --na:#a99c90;   --na-soft:#2e2722;
+  --r4:#c7a6dc; --r4-soft:#33263b;
+  --r5:#7fc8bf; --r5-soft:#1b322f;
+  --lift:0 1px 1px rgba(0,0,0,.3),0 18px 40px -20px rgba(0,0,0,.7);
+  color-scheme:dark;
 }
+
+/* =====================================================================
+   Base
+   ===================================================================== */
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{margin:0;font-family:'Public Sans','Segoe UI',system-ui,sans-serif;background:var(--canvas);
-  color:var(--ink);font-size:13.5px;line-height:1.5;
-  background-image:linear-gradient(180deg, rgba(44,95,138,.05), transparent 320px);}
-body.dark{background-image:linear-gradient(180deg, rgba(110,163,212,.06), transparent 320px);}
-
-/* ---------- topbar ---------- */
-header{display:flex;align-items:center;gap:14px;padding:0 22px;height:58px;
-  background:var(--panel);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:20}
-.wordmark{display:flex;align-items:baseline;gap:10px}
-.wordmark .glyph{width:26px;height:26px;border-radius:6px;align-self:center;flex-shrink:0;
-  background:var(--ink);position:relative}
-.wordmark .glyph::after{content:'';position:absolute;inset:7px;border:2px solid rgba(255,255,255,.85);
-  border-radius:3px;border-right-color:transparent;border-bottom-color:transparent;transform:rotate(-45deg)}
-.wordmark h1{font-family:'Libre Franklin','Segoe UI',sans-serif;font-size:16.5px;font-weight:800;
-  margin:0;letter-spacing:-.01em}
-.wordmark .eyebrow{font-size:10px;font-weight:600;letter-spacing:.14em;color:var(--faint);text-transform:uppercase}
-.srcchip{margin-left:auto;display:none;align-items:center;gap:7px;padding:5px 12px;border-radius:99px;
-  background:var(--accent-soft);color:var(--accent);font-weight:600;font-size:12px;white-space:nowrap}
-.srcchip .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
-.spinner{display:none;width:15px;height:15px;border:2.5px solid var(--border2);
-  border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.iconbtn{border:1px solid var(--border);background:var(--panel);color:var(--muted);
-  border-radius:8px;padding:6px 12px;cursor:pointer;font-size:12.5px;font-weight:600;font-family:inherit}
-.iconbtn:hover{border-color:var(--border2);color:var(--ink)}
-
-/* ---------- layout ---------- */
-.layout{display:flex;gap:16px;padding:18px 22px;align-items:flex-start;max-width:1560px;margin:0 auto}
-.sidebar{width:322px;flex-shrink:0;display:flex;flex-direction:column;gap:14px;
-  position:sticky;top:76px;max-height:calc(100vh - 94px);overflow-y:auto;padding-right:2px}
-.sidebar::-webkit-scrollbar{width:8px}
-.sidebar::-webkit-scrollbar-thumb{background:var(--border2);border-radius:8px}
-.main{flex:1;min-width:0}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
-  padding:16px;box-shadow:var(--shadow)}
-.card h3{margin:0 0 12px;font-size:10.5px;font-weight:700;text-transform:uppercase;
-  letter-spacing:.13em;color:var(--faint)}
-label{display:block;margin:10px 0 5px;font-weight:600;font-size:12px;color:var(--muted)}
-select,textarea,input[type=text]{width:100%;padding:8px 10px;border:1px solid var(--border);
-  border-radius:8px;background:var(--panel2);color:var(--ink);font-size:13px;font-family:inherit;
-  transition:border-color .15s, box-shadow .15s}
-select:focus,textarea:focus,input:focus{outline:none;border-color:var(--accent);
-  box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent)}
-select[multiple]{height:108px}
-textarea{height:180px;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
-.pathtoggle{font-size:11.5px;color:var(--accent);cursor:pointer;text-decoration:underline;
-  text-underline-offset:2px;font-weight:600}
-.exbtn{border:0;background:transparent;color:var(--faint);cursor:pointer;font-size:15px;
-  line-height:1;padding:2px 5px;border-radius:6px;font-family:inherit}
-.exbtn:hover{background:var(--bad-soft);color:var(--bad)}
-tr.dropped td{opacity:.32;text-decoration:line-through}
-tr.dropped .exbtn{text-decoration:none;opacity:1;color:var(--good)}
-.dropnote{font-size:11.5px;color:var(--warn);font-weight:700;padding:6px 20px;
-  background:var(--warn-soft);border-bottom:1px solid var(--border);display:none}
-.termcount{margin-top:5px;font-size:12px;font-weight:700;color:var(--accent);
-  background:var(--accent-soft);display:inline-block;padding:3px 11px;border-radius:99px}
-input[type=range]{width:100%;accent-color:var(--accent)}
-
-/* ---------- segmented ---------- */
-.seg{display:flex;background:var(--panel2);border:1px solid var(--border);border-radius:9px;padding:3px;gap:3px}
-.seg button{flex:1;padding:7px 4px;border:0;border-radius:7px;background:transparent;color:var(--muted);
-  cursor:pointer;font-weight:600;font-size:12.5px;font-family:inherit;transition:all .15s}
-.seg button:hover{color:var(--ink)}
-.seg button.on{background:var(--panel);color:var(--accent);
-  box-shadow:0 1px 3px rgba(16,24,38,.12);font-weight:700}
-
-/* ---------- buttons ---------- */
-.btn{padding:10px 18px;border:0;border-radius:9px;cursor:pointer;font-weight:700;
-  font-size:13.5px;font-family:inherit;transition:all .15s}
-.btn.primary{background:var(--accent);color:#fff}
-.btn.primary:hover{background:var(--accent-strong);transform:translateY(-1px);
-  box-shadow:0 4px 12px color-mix(in srgb, var(--accent) 35%, transparent)}
-.btn.ghost{background:transparent;color:var(--accent);border:1.5px solid var(--accent)}
-.btn.ghost:hover{background:var(--accent-soft)}
-.btn.grey{background:var(--panel2);color:var(--muted);border:1px solid var(--border)}
-.btn.grey:hover{color:var(--ink)}
-.btn:disabled{opacity:.45;cursor:not-allowed;transform:none!important;box-shadow:none!important}
-.btn:focus-visible,.seg button:focus-visible,.iconbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-
-.row{display:flex;gap:10px;flex-wrap:wrap}
-.status{font-size:12.5px;color:var(--muted);margin-top:10px;white-space:pre-wrap;line-height:1.6}
-.status.err{color:var(--bad)}
-.hint{font-size:11.5px;color:var(--faint);margin-top:5px;line-height:1.5}
-.checkline{display:flex;align-items:center;gap:8px;margin:6px 0;font-size:13px;cursor:pointer}
-.checkline input{width:15px;height:15px;accent-color:var(--accent);cursor:pointer}
-.checkline .swatch{width:9px;height:9px;border-radius:3px}
-
-/* ---------- results ---------- */
-.termcard{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
-  box-shadow:var(--shadow);margin-bottom:18px;overflow:hidden;
-  animation:rise .35s ease both}
-@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+body{margin:0;font-family:var(--sans);color:var(--ink);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
+  background:radial-gradient(1200px 700px at 8% -10%,#fbf6f0 0,transparent 60%),
+    radial-gradient(900px 600px at 105% 15%,#ecdccb 0,transparent 65%),var(--canvas);background-attachment:fixed}
+body.dark{background:radial-gradient(1000px 600px at 105% 10%,#2c211a 0,transparent 65%),var(--canvas);background-attachment:fixed}
+/* small spaced capitals with a spark, as in the reference */
+.eyebrow{font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--accent)}
+.eyebrow::before{content:'\2726';margin-right:8px;font-size:10px}
+button,input,select,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+code{font-family:var(--mono);font-size:.9em;background:var(--sunk);border:1px solid var(--rule);
+  padding:0 .3em;border-radius:4px}
 @media (prefers-reduced-motion: reduce){
-  .termcard{animation:none}
-  .covfill{transition:none!important}
+  *,*::before,*::after{animation:none!important;transition:none!important}
   html{scroll-behavior:auto}
 }
-.termhead{display:flex;align-items:center;gap:14px;padding:15px 20px;cursor:pointer;
-  border-bottom:1px solid var(--border);flex-wrap:wrap}
-.termhead:hover{background:var(--panel2)}
-.termhead .arrow{color:var(--faint);font-size:11px;transition:transform .15s}
-.termhead.closed .arrow{transform:rotate(-90deg)}
-.termname{font-family:'Libre Franklin','Segoe UI',sans-serif;font-size:18.5px;font-weight:700;
-  letter-spacing:-.01em}
-.termname::before{content:'“';color:var(--steel)}
-.termname::after{content:'”';color:var(--steel)}
-.hitpill{padding:3px 12px;border-radius:99px;background:var(--accent);color:#fff;
-  font-weight:700;font-size:12px}
-.hitpill.zero{background:var(--na-soft);color:var(--na)}
-.aliaswrap{display:inline-flex;gap:5px;flex-wrap:wrap;align-items:center}
-.scopetag{padding:2px 9px;border-radius:99px;background:var(--tc-soft);color:var(--tc);
-  font-size:11.5px;font-weight:700;border:1px solid var(--border2)}
-.formsbar{display:flex;gap:6px;flex-wrap:wrap;padding:9px 20px;background:var(--panel2);
-  border-bottom:1px solid var(--border);align-items:center}
-.formsbar .lbl{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
-  color:var(--faint);margin-right:2px}
-.form{padding:2px 9px;border-radius:6px;background:var(--mark);color:var(--mark-ink);
-  font-size:11.5px;font-weight:700;font-family:ui-monospace,Consolas,monospace}
-.form i{font-style:normal;font-weight:600;opacity:.65;margin-left:3px}
-.warnbar{padding:9px 20px;background:var(--warn-soft);border-bottom:1px solid var(--border);
-  color:var(--warn);font-size:12px;font-weight:600;line-height:1.55}
-.warnbar div+div{margin-top:3px}
-#interp{margin-top:12px;display:none}
-.itable{width:100%;border-collapse:separate;border-spacing:0;font-size:12.5px;
-  border:1px solid var(--border);border-radius:9px;overflow:hidden;background:var(--panel)}
-.itable th{background:var(--panel2);text-align:left;padding:7px 10px;font-size:10.5px;
-  text-transform:uppercase;letter-spacing:.08em;color:var(--faint);font-weight:700}
-.itable td{padding:8px 10px;border-top:1px solid var(--border);vertical-align:top}
-.itable code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
+
+/* the highlighter: the one loud thing on the page */
+mark,.hl{color:var(--mark-ink);font-weight:600;border-radius:.3em .15em .35em .2em;
+  padding:.02em .08em;margin:0 -.08em;-webkit-box-decoration-break:clone;box-decoration-break:clone;
+  background:linear-gradient(100deg,color-mix(in srgb,var(--mark) 55%,transparent) 0,
+    var(--mark) .3em,var(--mark) calc(100% - .3em),color-mix(in srgb,var(--mark) 65%,transparent) 100%)}
+
+/* =====================================================================
+   Top bar
+   ===================================================================== */
+.top{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:16px;height:64px;
+  padding:0 28px;background:color-mix(in srgb,var(--canvas) 78%,transparent);backdrop-filter:blur(14px);
+  -webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--rule)}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.brandmark{font-size:22px;line-height:1;color:var(--accent);flex-shrink:0}
+.brandmark::before{content:'\2726'}
+.brandname{font-family:var(--display);font-weight:400;font-size:25px;letter-spacing:-.01em;line-height:1}
+.brandname i{color:var(--accent)}
+.brandsub{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.srcchip{display:none;align-items:center;gap:8px;padding:5px 12px;border-radius:99px;
+  border:1px solid var(--rule2);background:var(--glass);color:var(--muted);font-size:12.5px;font-weight:500;white-space:nowrap}
+.srcchip .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+.spinner{display:none;width:16px;height:16px;border:2px solid var(--rule2);border-top-color:var(--accent);
+  border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.iconbtn{border:1px solid var(--rule2);background:transparent;color:var(--muted);border-radius:3px;
+  padding:7px 12px;cursor:pointer;font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;white-space:nowrap}
+.iconbtn:hover{border-color:var(--rule2);color:var(--ink)}
+.top .grow{flex:1}
+.sr{position:absolute;left:0;top:0;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+table.results th{position:relative}
+
+/* =====================================================================
+   Layout
+   ===================================================================== */
+.layout{display:grid;grid-template-columns:340px minmax(0,1fr);gap:32px;padding:32px 28px;
+  max-width:1640px;margin:0 auto;align-items:start}
+.rail{position:sticky;top:84px;max-height:calc(100vh - 104px);overflow-y:auto;display:flex;flex-direction:column;
+  gap:2px;padding-right:4px;scrollbar-width:thin}
+.panel{padding:18px 2px 22px;border-bottom:1px solid var(--rule)}
+.panel:last-child{border-bottom:0}
+.ptitle{font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);
+  margin:0 0 14px;display:flex;align-items:center;gap:8px}
+.ptitle::before{content:'\2726';font-size:10px}
+.ptitle .sub{font-weight:400;font-size:12.5px;color:var(--faint)}
+.main{min-width:0}
+
+label{display:block;margin:12px 0 5px;font-weight:600;font-size:12.5px;color:var(--muted)}
+label .opt{font-weight:400;color:var(--faint)}
+select,textarea,input[type=text],input[type=search]{width:100%;padding:8px 10px;border:1px solid var(--rule2);
+  border-radius:4px;background:var(--surface);color:var(--ink);font-size:13.5px;transition:border-color .15s,box-shadow .15s}
+select:focus,textarea:focus,input[type=text]:focus,input[type=search]:focus{outline:none;border-color:var(--accent);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 20%,transparent)}
+input[type=range]{width:100%;accent-color:var(--accent)}
+input[type=checkbox]{accent-color:var(--accent)}
+
+.seg{display:flex;background:var(--sunk);border:1px solid var(--rule);border-radius:5px;padding:3px;gap:2px}
+.seg button{flex:1;padding:7px 6px;border:0;border-radius:3px;background:transparent;color:var(--muted);
+  cursor:pointer;font-weight:500;font-size:13px;white-space:nowrap;transition:background .15s,color .15s}
+.seg button:hover{color:var(--ink)}
+.seg button.on{background:var(--surface);color:var(--ink);font-weight:600;
+  box-shadow:0 1px 2px rgba(60,35,20,.12),inset 0 -2px 0 var(--accent)}
+.seg.mini{display:inline-flex}
+.seg.mini button{flex:none;padding:4px 12px;font-size:12.5px}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:11px 18px;border:1px solid transparent;
+  border-radius:3px;cursor:pointer;font-family:var(--mono);font-weight:500;font-size:11.5px;letter-spacing:.12em;text-transform:uppercase;
+  transition:background .15s,border-color .15s,color .15s,box-shadow .15s}
+.btn.primary{background:var(--accent);color:var(--on-accent);box-shadow:0 8px 20px -10px color-mix(in srgb,var(--accent) 70%,transparent)}
+.btn.primary:hover{background:var(--accent-strong)}
+.btn.ghost{background:transparent;color:var(--accent);border-color:color-mix(in srgb,var(--accent) 55%,var(--rule))}
+.btn.ghost:hover{background:var(--accent-soft)}
+.btn.grey{background:transparent;color:var(--muted);border-color:var(--rule2)}
+.btn.grey:hover{color:var(--ink);background:var(--sunk)}
+.btn.wide{width:100%}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.linkbtn{background:none;border:0;color:var(--accent);cursor:pointer;font-weight:600;font-size:inherit;padding:0;
+  text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:3px}
+.linkbtn:hover{color:var(--accent-strong)}
+
+.status{font-size:12.5px;color:var(--muted);margin-top:10px;white-space:pre-wrap;line-height:1.6}
+.status.err{color:var(--bad)}
+.hint{font-size:12px;color:var(--faint);margin-top:6px;line-height:1.5}
+.kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--rule2);border-bottom-width:2px;border-radius:4px;
+  padding:0 4px;background:var(--sunk);color:var(--muted)}
+.checkline{display:flex;align-items:flex-start;gap:9px;margin:10px 0 0;font-size:13px;font-weight:400;color:var(--ink);cursor:pointer}
+.checkline input{width:16px;height:16px;margin:1px 0 0;flex-shrink:0;cursor:pointer}
+
+.pathtoggle{margin-top:12px}
+#pathFields{margin-top:4px}
+.roundhint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.5}
+
+/* =====================================================================
+   Filters (rail)
+   ===================================================================== */
+.ftop{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.ftop .ptitle{margin:0}
+.expandbtn{margin-left:auto;display:inline-flex;align-items:center;gap:6px;border:1px solid color-mix(in srgb,var(--accent) 50%,var(--rule2));
+  background:transparent;color:var(--accent);border-radius:3px;padding:6px 10px;cursor:pointer;font-family:var(--mono);font-size:10.5px;
+  letter-spacing:.12em;text-transform:uppercase}
+.expandbtn:hover{background:var(--accent-soft)}
+.expandbtn svg{width:13px;height:13px}
+.fsummary{font-size:12px;color:var(--muted);margin:-4px 0 12px;line-height:1.5}
+.tabletoggles{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.ttog{position:relative;display:inline-flex;align-items:center;gap:7px;margin:0;padding:5px 10px 5px 9px;border-radius:99px;
+  border:1px solid var(--rule2);font-size:12.5px;font-weight:500;color:var(--muted);cursor:pointer;background:var(--surface);user-select:none}
+.ttog input{position:absolute;opacity:0;pointer-events:none}
+.ttog .sw{width:9px;height:9px;border-radius:2px;background:var(--c);opacity:.35}
+.ttog:has(input:checked){color:var(--ink);border-color:color-mix(in srgb,var(--c) 55%,var(--rule2));
+  background:color-mix(in srgb,var(--c) 9%,var(--surface))}
+.ttog:has(input:checked) .sw{opacity:1}
+.ttog:has(input:focus-visible){outline:2px solid var(--accent);outline-offset:2px}
+
+.facet{border:1px solid var(--rule);border-radius:6px;background:var(--glass);margin-top:8px;overflow:hidden}
+.facet-head{display:flex;align-items:center;gap:8px;width:100%;padding:9px 10px 9px 8px;background:none;border:0;
+  cursor:pointer;text-align:left;font-size:13.5px;font-weight:600}
+.facet-head:hover{background:var(--sunk)}
+.caret{width:16px;height:16px;flex-shrink:0;display:inline-grid;place-items:center;color:var(--faint);transition:transform .15s}
+.caret::before{content:'';width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;
+  transform:translate(-1px,-1px) rotate(45deg)}
+.closed>.facet-head .caret,.fgroup:not(.open)>.fghead .fcaret{transform:rotate(-90deg)}
+.facet-count{margin-left:auto;font-size:12px;font-weight:500;color:var(--faint);white-space:nowrap}
+.facet-count.some{color:var(--accent);font-weight:600}
+.facet-count.none{color:var(--bad);font-weight:600}
+.facet-body{border-top:1px solid var(--rule);padding:8px}
+.closed>.facet-body{display:none}
+.facet-tools{display:flex;gap:4px;align-items:center;margin-bottom:6px}
+.facet-tools input{padding:6px 8px;font-size:12.5px}
+.mini{border:1px solid var(--rule2);background:var(--surface);color:var(--muted);border-radius:3px;padding:5px 8px;
+  cursor:pointer;font-size:12px;font-weight:500;white-space:nowrap}
+.mini:hover{color:var(--ink);background:var(--sunk)}
+.flist{max-height:236px;overflow:auto;margin:0 -4px;padding:0 4px;scrollbar-width:thin}
+.fempty{font-size:12.5px;color:var(--faint);padding:8px 4px}
+
+/* tree, shared by the rail and the pop-out */
+.fgroup{margin:2px 0}
+.fghead{display:flex;align-items:center;gap:4px;padding:3px 2px;border-radius:6px}
+.fghead:hover{background:var(--sunk)}
+.fcaret{border:0;background:none;padding:0;cursor:pointer;color:var(--faint);width:18px;height:18px;display:grid;place-items:center;
+  transition:transform .15s;flex-shrink:0}
+.fcaret::before{content:'';width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;
+  transform:translate(-1px,-1px) rotate(45deg)}
+.fgcheck{display:flex;align-items:center;gap:7px;margin:0;font-size:13px;font-weight:600;color:var(--ink);cursor:pointer;min-width:0;flex:1}
+.fgcheck input,.fitem input{width:15px;height:15px;margin:0;flex-shrink:0;cursor:pointer}
+.fgname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fgcount{font-size:11.5px;color:var(--faint);font-variant-numeric:tabular-nums;padding-right:4px}
+.fgbody{padding-left:22px}
+.fitems{display:flex;flex-direction:column}
+.fitem{display:flex;align-items:flex-start;gap:7px;margin:0;padding:3px 4px;border-radius:6px;font-size:13px;
+  font-weight:400;color:var(--ink);cursor:pointer;line-height:1.35}
+.fitem:hover{background:var(--sunk)}
+.fitem input{margin-top:1px}
+.fitem .q{background:var(--mark);color:var(--mark-ink);border-radius:2px}
+.fitem.off span{color:var(--muted)}
+
+/* =====================================================================
+   Filters pop-out
+   ===================================================================== */
+dialog.fdlg{padding:0;border:1px solid var(--rule2);border-radius:8px;background:var(--surface);color:var(--ink);
+  width:min(1180px,94vw);height:min(820px,90vh);max-width:none;max-height:none;box-shadow:0 30px 80px -20px rgba(0,0,0,.45);
+  display:none;flex-direction:column;overflow:hidden}
+dialog.fdlg[open]{display:flex;animation:pop .18s ease-out}
+dialog.fdlg.max{width:100vw;height:100vh;border-radius:0;border:0}
+dialog.fdlg::backdrop{background:rgba(40,24,14,.35);backdrop-filter:blur(4px)}
+@keyframes pop{from{opacity:0;transform:scale(.985)}to{opacity:1;transform:none}}
+.fdlg-head{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--rule)}
+.fdlg-head h2{margin:0;font-family:var(--display);font-size:34px;font-weight:400;letter-spacing:-.01em;line-height:1}
+.fdlg-head h2 i{color:var(--accent)}
+.fdlg-head p{margin:2px 0 0;font-size:13px;color:var(--muted)}
+.fdlg-head .sp{flex:1}
+.fdlg-body{flex:1;min-height:0;display:grid;grid-template-columns:240px minmax(0,1fr)}
+.fdlg-nav{border-right:1px solid var(--rule);background:var(--sunk);padding:12px;overflow:auto;display:flex;flex-direction:column;gap:4px}
+.navtab{display:flex;flex-direction:column;align-items:flex-start;gap:1px;width:100%;text-align:left;padding:9px 12px;border:1px solid transparent;
+  border-radius:9px;background:none;cursor:pointer}
+.navtab:hover{background:var(--surface)}
+.navtab.on{background:var(--surface);border-color:var(--rule2);box-shadow:inset 3px 0 0 var(--accent)}
+.navtab b{font-size:14px;font-weight:600}
+.navtab span{font-size:12px;color:var(--muted)}
+.navtab span.some{color:var(--accent);font-weight:600}
+.navtab span.none{color:var(--bad);font-weight:600}
+.navsep{margin:14px 4px 6px;font-size:12px;font-weight:600;color:var(--muted)}
+.fdlg-nav .tabletoggles{flex-direction:column;align-items:stretch;padding:0 2px}
+.fdlg-pane{display:flex;flex-direction:column;min-height:0}
+.fdlg-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 20px 10px}
+.fdlg-tools input[type=search]{flex:1 1 260px;width:auto;padding:9px 12px;font-size:14px}
+.fdlg-tools .checkline{margin:0 0 0 4px;white-space:nowrap}
+.presets{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:0 20px 10px;font-size:12.5px;color:var(--muted)}
+.presets:empty{display:none}
+.preset{border:1px dashed var(--rule2);background:var(--surface);color:var(--ink);border-radius:99px;padding:4px 11px;cursor:pointer;
+  font-size:12.5px}
+.preset:hover{border-style:solid;border-color:var(--accent);color:var(--accent)}
+.preset small{color:var(--faint);margin-left:3px}
+.fdlg-list{flex:1;min-height:0;overflow:auto;padding:4px 20px 20px;border-top:1px solid var(--rule)}
+.fdlg-list>.fgroup{padding:10px 0;margin:0;border-bottom:1px solid var(--rule)}
+.fdlg-list>.fgroup:last-child{border-bottom:0}
+.fdlg-list>.fgroup>.fghead{padding:4px 2px}
+.fdlg-list>.fgroup>.fghead .fgcheck{font-size:14.5px}
+.fdlg-list .fgroup .fgroup{break-inside:avoid}
+.fdlg-list .fitems{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:0 12px}
+.fdlg-list .fgbody{padding-left:24px}
+.fdlg-list .fgbody:has(>.fgroup){display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:4px 18px;padding-top:4px}
+.fdlg-list .fgbody>.fgroup .fitems{grid-template-columns:1fr}
+.fdlg-list>.fitems{padding-top:10px}
+.fdlg-foot{display:flex;align-items:center;gap:12px;padding:14px 20px;border-top:1px solid var(--rule);background:var(--sunk)}
+.fdlg-foot .note{font-size:12.5px;color:var(--muted);flex:1}
+
+/* =====================================================================
+   Composer
+   ===================================================================== */
+.composer{background:var(--glass);border:1px solid var(--glass-edge);outline:1px solid var(--rule);border-radius:8px;box-shadow:var(--lift);
+  padding:24px 26px 22px;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+.ctitle{font-family:var(--display);font-weight:400;font-size:44px;line-height:1;letter-spacing:-.015em;margin:8px 0 18px}
+.ctitle i{color:var(--accent)}
+.chead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:8px}
+.chead label{margin:0;font-size:14px;color:var(--ink)}
+.termcount{font-size:12.5px;font-weight:600;color:var(--accent)}
+.chead .hint{margin:0 0 0 auto}
+textarea#terms{height:164px;resize:vertical;font-family:var(--mono);font-size:13px;line-height:1.6;background:var(--sunk)}
+.syntax{margin-top:8px;font-size:12.5px;color:var(--muted)}
+.syntax summary{cursor:pointer;color:var(--accent);font-weight:600;width:max-content}
+.syntax table{border-collapse:collapse;margin-top:8px;width:100%;max-width:760px}
+.syntax td{padding:5px 10px 5px 0;border-top:1px solid var(--rule);vertical-align:top}
+.syntax td:first-child{white-space:nowrap;width:1%}
+.optrow{display:grid;grid-template-columns:minmax(0,420px) minmax(0,1fr);gap:8px 28px;margin-top:14px;align-items:start}
+.optrow label{margin-top:0}
+#thresholdWrap{display:none;margin-top:10px;padding:10px 12px;background:var(--sunk);border-radius:9px;border:1px solid var(--rule)}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;align-items:center}
+.actions .btn.primary{padding:10px 26px}
+.progwrap{display:none;margin-top:12px}
+.progbar{height:6px;border-radius:99px;background:var(--sunk);border:1px solid var(--rule);overflow:hidden}
+.progfill{height:100%;width:0;background:var(--accent);transition:width .35s}
+.progtxt{font-size:12.5px;color:var(--muted);margin-top:5px}
+.exportbox{margin-top:18px;padding-top:16px;border-top:1px solid var(--rule)}
+.exportbox h3{margin:0 0 6px}
+.exgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 20px}
+.exportrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.exportrow select{width:auto;padding:7px 8px;font-size:13px}
+
+#interp{margin-top:14px;display:none}
+.itable{width:100%;border-collapse:separate;border-spacing:0;font-size:13px;border:1px solid var(--rule);border-radius:10px;overflow:hidden}
+.itable th{background:var(--sunk);text-align:left;padding:8px 10px;font-size:12px;color:var(--muted);font-weight:600}
+.itable td{padding:9px 10px;border-top:1px solid var(--rule);vertical-align:top}
 .iwarn{color:var(--warn);font-weight:600}
 .inote{color:var(--muted)}
-.iok{color:var(--good);font-weight:700}
-.aliaswrap::before{content:'=';color:var(--faint);font-weight:700;margin-right:1px}
-.alias{padding:2px 9px;border-radius:99px;background:var(--accent-soft);color:var(--accent);
-  font-size:11.5px;font-weight:600;border:1px solid var(--border2)}
+.iok{color:var(--good);font-weight:600}
 
-/* coverage gauge — the signature */
-.cov{margin-left:auto;min-width:280px;flex:0 1 340px}
-.covtop{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px}
-.covlabel{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--faint)}
-.covnum{font-family:'Libre Franklin',sans-serif;font-weight:700;font-size:15px;color:var(--accent)}
-.covnum small{font-size:11.5px;color:var(--muted);font-weight:600;font-family:'Public Sans',sans-serif}
-.covtrack{height:9px;border-radius:99px;background:var(--panel2);border:1px solid var(--border);
-  overflow:hidden;position:relative}
-.covfill{height:100%;border-radius:99px;width:0;
-  background:linear-gradient(90deg,var(--accent),var(--steel));
-  transition:width .8s cubic-bezier(.25,.9,.3,1)}
-.covcountries{font-size:11.5px;color:var(--accent);cursor:pointer;text-decoration:underline;
-  text-underline-offset:2px;margin-top:4px;display:inline-block}
-.chipbox{display:none;padding:12px 20px;background:var(--panel2);border-bottom:1px solid var(--border);
-  gap:6px;flex-wrap:wrap}
+/* =====================================================================
+   Results
+   ===================================================================== */
+#results{margin-top:22px}
+.welcome{padding:56px 24px;text-align:center;color:var(--muted);border:1px dashed var(--rule2);border-radius:8px}
+.welcome h2{font-family:var(--display);font-weight:400;font-size:32px;color:var(--ink);margin:0 0 10px;letter-spacing:-.01em}
+.welcome h2 i{color:var(--accent)}
+.welcome p{margin:0 auto;max-width:56ch}
+.roundnote,.dropnote{padding:10px 14px;margin-bottom:14px;border-radius:10px;font-size:13px;line-height:1.6}
+.roundnote{background:var(--glass);border:1px solid var(--rule);color:var(--muted)}
+.roundnote b{color:var(--ink)}
+.dropnote{display:none;background:var(--warn-soft);color:var(--warn);font-weight:600}
+
+.termcard{background:var(--glass);border:1px solid var(--glass-edge);outline:1px solid var(--rule);border-radius:8px;box-shadow:var(--lift);
+  margin-bottom:24px;overflow:hidden;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+.termhead{display:flex;align-items:center;gap:10px 14px;padding:16px 20px;cursor:pointer;flex-wrap:wrap}
+.termhead:hover{background:color-mix(in srgb,var(--sunk) 70%,transparent)}
+.termhead .arrow{width:16px;height:16px;display:grid;place-items:center;color:var(--faint);transition:transform .15s;flex-shrink:0}
+.termhead .arrow::before{content:'';width:7px;height:7px;border-right:1.8px solid currentColor;border-bottom:1.8px solid currentColor;
+  transform:translate(-1px,-2px) rotate(45deg)}
+.termhead.closed .arrow{transform:rotate(-90deg)}
+.termname{font-family:var(--display);font-style:italic;font-size:36px;font-weight:400;letter-spacing:-.01em;line-height:1.05;color:var(--accent)}
+.hitpill{padding:3px 11px;border-radius:99px;background:var(--ink);color:var(--surface);font-weight:600;font-size:12.5px;font-variant-numeric:tabular-nums}
+.hitpill.zero{background:var(--na-soft);color:var(--na)}
+.rpill{padding:2px 9px;border-radius:99px;font-weight:600;font-size:12px}
+.rpill.r4{background:var(--r4-soft);color:var(--r4)}
+.rpill.r5{background:var(--r5-soft);color:var(--r5)}
+.aliaswrap{display:inline-flex;gap:5px;flex-wrap:wrap;align-items:center;font-size:12.5px;color:var(--faint)}
+.alias{padding:2px 9px;border-radius:99px;background:var(--accent-soft);color:var(--accent);font-size:12px;font-weight:500}
+.scopetag{padding:2px 9px;border-radius:99px;background:var(--r5-soft);color:var(--r5);font-size:12px;font-weight:600}
+
+.covs{margin-left:auto;display:flex;gap:20px;flex-wrap:wrap;flex:0 1 560px;justify-content:flex-end}
+.cov{min-width:210px;flex:1 1 230px}
+.covtop{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:5px}
+.covlabel{font-size:12px;font-weight:500;color:var(--muted)}
+.covnum{font-weight:700;font-size:15px;color:var(--accent);font-variant-numeric:tabular-nums}
+.covnum small{font-size:12px;color:var(--muted);font-weight:500}
+.covnum.r4{color:var(--r4)} .covnum.r5{color:var(--r5)}
+.covtrack{height:6px;border-radius:99px;background:var(--sunk);overflow:hidden;box-shadow:inset 0 0 0 1px var(--rule)}
+.covfill{height:100%;border-radius:99px;width:0;background:var(--accent);transition:width .8s cubic-bezier(.25,.9,.3,1)}
+.covfill.r4{background:var(--r4)} .covfill.r5{background:var(--r5)}
+.covcountries{font-size:12.5px}
+
+.warnbar{padding:9px 20px;background:var(--warn-soft);color:var(--warn);font-size:12.5px;font-weight:500;line-height:1.55;border-top:1px solid var(--rule)}
+.warnbar div+div{margin-top:3px}
+.formsbar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:10px 20px;border-top:1px solid var(--rule);background:var(--sunk)}
+.formsbar .lbl{font-size:12.5px;color:var(--muted);margin-right:4px}
+.form{padding:1px 8px;border-radius:5px;background:var(--surface);border:1px solid var(--rule2);font-size:12.5px;font-weight:600}
+.form i{font-style:normal;font-weight:500;color:var(--faint);margin-left:5px;font-variant-numeric:tabular-nums}
+.chipbox{display:none;padding:14px 20px;background:var(--sunk);border-top:1px solid var(--rule);flex-direction:column;gap:10px}
 .chipbox.open{display:flex}
-.chip{padding:3px 10px;border-radius:99px;background:var(--panel);border:1px solid var(--border2);
-  font-size:11.5px;font-weight:600}
-.chip b{color:var(--accent)}
+.chiprow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.chip{padding:3px 10px;border-radius:99px;background:var(--surface);border:1px solid var(--rule2);font-size:12.5px}
+.chip b{color:var(--accent);font-variant-numeric:tabular-nums}
+.cmpt{border-collapse:collapse;font-size:12.5px;margin-top:2px}
+.cmpt td,.cmpt th{padding:4px 12px 4px 0;border-bottom:1px solid var(--rule);text-align:left}
+.cmpt th{font-size:12px;color:var(--muted);font-weight:600}
+.pat{font-size:11.5px;font-weight:600;padding:1px 8px;border-radius:99px}
+.pat.both{background:var(--good-soft);color:var(--good)}
+.pat.p4{background:var(--r4-soft);color:var(--r4)}
+.pat.p5{background:var(--r5-soft);color:var(--r5)}
+.pat.none{background:var(--na-soft);color:var(--na)}
 
-.termbody{padding:8px 20px 18px}
-.tblsec{margin-top:16px}
-.secbar{display:flex;align-items:center;gap:10px;margin-bottom:9px}
-.secbar .bar{width:4px;height:18px;border-radius:3px}
-.secbar .name{font-weight:700;font-size:13.5px}
-.secbar .cnt{font-size:12px;color:var(--muted);font-weight:600}
-.secbar .capnote{font-size:11px;color:var(--faint);margin-left:auto}
+.termbody{padding:4px 20px 20px;border-top:1px solid var(--rule)}
+.cardtools{display:flex;align-items:center;gap:10px;padding:14px 0 0;flex-wrap:wrap;font-size:12.5px;color:var(--muted)}
+.tblsec{margin-top:18px}
+.secbar{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.secbar .bar{width:10px;height:10px;border-radius:3px}
+.secbar .name{font-family:var(--display);font-size:21px;font-weight:400}
+.secbar .cnt{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
 
-table.results{width:100%;border-collapse:separate;border-spacing:0;background:var(--panel);
-  border:1px solid var(--border);border-radius:9px;overflow:hidden;font-size:12.5px;table-layout:fixed}
-table.results th{background:var(--panel2);text-align:left;padding:8px 10px;
-  border-bottom:1px solid var(--border2);font-size:10.5px;text-transform:uppercase;
-  letter-spacing:.08em;color:var(--faint);font-weight:700}
-table.results td{padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top;
-  word-wrap:break-word}
-table.results tr:last-child td{border-bottom:0}
-table.results tbody tr:hover td{background:color-mix(in srgb, var(--accent-soft) 45%, transparent)}
-mark{background:var(--mark);color:var(--mark-ink);font-weight:800;padding:0 2px;border-radius:3px}
+table.results{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--rule);border-radius:6px;background:var(--surface);
+  overflow:hidden;font-size:13px;table-layout:fixed}
+table.results th{background:var(--sunk);text-align:left;padding:8px 10px;border-bottom:1px solid var(--rule);
+  font-size:12px;color:var(--muted);font-weight:600}
+table.results td{padding:10px;border-bottom:1px solid var(--rule);vertical-align:top;overflow-wrap:anywhere}
+table.results tbody tr:last-child td{border-bottom:0}
+table.results tbody tr.hit:hover td{background:color-mix(in srgb,var(--accent-soft) 40%,transparent)}
+td.jur{font-weight:600}
+td.meas{font-variant-numeric:tabular-nums;color:var(--muted)}
+td.ctx{font-family:var(--serif);font-size:14px;line-height:1.6}
+tr.dropped td{opacity:.35}
+tr.dropped td.ctx{text-decoration:line-through}
+tr.dropped td.acts{opacity:1}
+.rowtools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;font-family:var(--sans);font-size:12.5px}
+.readbtn{display:inline-flex;align-items:center;gap:5px;border:1px solid color-mix(in srgb,var(--accent) 45%,var(--rule2));background:transparent;
+  color:var(--accent);border-radius:3px;padding:3px 9px;cursor:pointer;font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase}
+.readbtn:hover{background:var(--accent-soft)}
+.readbtn[aria-expanded=true]{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
+.fmt{font-size:11.5px;color:var(--muted);border:1px solid var(--rule);border-radius:5px;padding:0 6px;background:var(--sunk)}
+.acts{white-space:nowrap;text-align:right}
+.actbtn,.exbtn{border:0;background:transparent;color:var(--faint);cursor:pointer;font-size:14px;line-height:1;padding:4px 6px;border-radius:6px}
+.actbtn:hover{background:var(--accent-soft);color:var(--accent)}
+.exbtn:hover{background:var(--bad-soft);color:var(--bad)}
+.actbtn.done{color:var(--good)}
+tr.dropped .exbtn{color:var(--good)}
 
-.pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700;
-  white-space:nowrap;margin:1px 0}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:600;white-space:nowrap;margin:1px 0}
 .pill.good{background:var(--good-soft);color:var(--good)}
 .pill.mid{background:var(--mid-soft);color:var(--mid)}
 .pill.warn{background:var(--warn-soft);color:var(--warn)}
 .pill.bad{background:var(--bad-soft);color:var(--bad)}
 .pill.na{background:var(--na-soft);color:var(--na)}
-
-.full{display:none;margin-top:8px;padding:11px;background:var(--panel2);border:1px solid var(--border);
-  border-radius:8px;max-height:320px;overflow:auto;line-height:1.65}
-.showfull{color:var(--accent);cursor:pointer;font-size:11.5px;font-weight:600;
-  text-decoration:underline;text-underline-offset:2px;white-space:nowrap}
-.empty{color:var(--faint);font-size:12.5px;padding:10px 2px;font-style:italic}
-
-.hist a{display:block;color:var(--accent);cursor:pointer;padding:4px 0;text-decoration:none;
-  font-size:12.5px;border-bottom:1px dashed var(--border);overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap}
-.hist a:last-child{border-bottom:0}
-.hist a:hover{color:var(--accent-strong)}
-.hist .empty{border:0}
-#thresholdWrap{display:none;margin-top:8px;padding:10px 12px;background:var(--panel2);
-  border-radius:9px;border:1px solid var(--border)}
-.welcome{text-align:center;padding:64px 20px;color:var(--faint)}
-.welcome .biglyph{font-family:'Libre Franklin',sans-serif;font-size:42px;font-weight:700;
-  color:var(--border2);letter-spacing:-.02em;margin-bottom:8px}
-@media (max-width:980px){.layout{flex-direction:column}.sidebar{width:100%;position:static;max-height:none}
-  .cov{min-width:0;flex-basis:100%;margin-left:0}}
-</style>
-<style>
-/* ---------- v8 additions: rounds, progress, paging ---------- */
-:root{--r4:#5b4b8a;--r4-soft:#ece7f7;--r5:#946600;--r5-soft:#fbefcf}
-body.dark{--r4:#b9abec;--r4-soft:#2b2546;--r5:#e3bb5f;--r5-soft:#3a2f14}
-.rtag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:10.5px;font-weight:800;
-  letter-spacing:.03em;white-space:nowrap;line-height:1.6}
+.rtag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:11.5px;font-weight:700;white-space:nowrap}
 .rtag.r4{background:var(--r4-soft);color:var(--r4)}
 .rtag.r5{background:var(--r5-soft);color:var(--r5)}
-.rpill{padding:2px 10px;border-radius:99px;font-weight:700;font-size:11.5px;border:1px solid var(--border2)}
-.rpill.r4{background:var(--r4-soft);color:var(--r4)}
-.rpill.r5{background:var(--r5-soft);color:var(--r5)}
-.covs{margin-left:auto;display:flex;gap:18px;flex-wrap:wrap;flex:0 1 560px;justify-content:flex-end}
-.covs .cov{margin-left:0;min-width:200px;flex:1 1 230px}
-.covfill.r4{background:var(--r4)}
-.covfill.r5{background:var(--r5)}
-.covnum.r4{color:var(--r4)} .covnum.r5{color:var(--r5)}
-.roundhint{font-size:11.5px;color:var(--muted);margin-top:7px;line-height:1.5}
-.roundnote{padding:10px 16px;margin-bottom:14px;border-radius:10px;background:var(--panel);
-  border:1px solid var(--border);box-shadow:var(--shadow);font-size:12.5px;color:var(--muted);
-  line-height:1.7}
-#roundSeg button{white-space:nowrap;font-size:12px;padding:7px 2px}
-body.dark .btn.primary{color:#0d1725}
-.roundnote b{color:var(--ink)}
-.progwrap{display:none;margin-top:10px}
-.progbar{height:8px;border-radius:99px;background:var(--panel2);border:1px solid var(--border);overflow:hidden}
-.progfill{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--steel));transition:width .35s}
-.progtxt{font-size:12px;color:var(--muted);margin-top:5px}
-.cardtools{display:flex;align-items:center;gap:10px;padding:12px 0 2px;flex-wrap:wrap}
-.cardtools .lbl{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
-.seg.mini{display:inline-flex}
-.seg.mini button{flex:none;padding:4px 12px;font-size:12px}
+
+/* ---------- the rendered paragraph ---------- */
+tr.docrow>td{padding:0 10px 14px;background:var(--sunk)}
+.doc{background:var(--doc);border:1px solid var(--rule);border-left:3px solid var(--c,var(--accent));border-radius:2px 6px 6px 2px;
+  padding:16px 22px 18px;margin-top:2px;box-shadow:var(--lift)}
+.dochead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:12.5px;color:var(--muted);
+  padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid var(--rule)}
+.dochead .cite{font-weight:600;color:var(--ink)}
+.dochead .sp{flex:1}
+.docbody{font-family:var(--serif);font-size:15.5px;line-height:1.7;color:var(--ink);max-width:88ch}
+.docbody>*:first-child{margin-top:0}
+.docbody>*:last-child{margin-bottom:0}
+.docbody p{margin:0 0 .75em}
+.docbody ul,.docbody ol{margin:0 0 .75em;padding-left:1.5em}
+.docbody li{margin:.2em 0}
+.docbody li::marker{color:var(--faint)}
+.docbody h4,.docbody h5,.docbody h6{font-family:var(--sans);margin:1em 0 .4em;font-size:15px}
+.docbody sup,.docbody sub{font-size:.7em;line-height:0}
+.docbody sup{color:var(--accent)}
+.docbody a{color:var(--accent)}
+.docbody blockquote{margin:0 0 .75em;padding-left:14px;border-left:3px solid var(--rule2);color:var(--muted)}
+.docbody hr{border:0;border-top:1px solid var(--rule);margin:1em 0}
+.docbody .tblwrap{overflow-x:auto;margin:.4em 0 1em;max-width:100%}
+.docbody table{border-collapse:collapse;font-family:var(--sans);font-size:13px;line-height:1.45;min-width:50%;
+  background:var(--surface);border:1px solid var(--rule2)}
+.docbody th,.docbody td{border:1px solid var(--rule2);padding:6px 10px;vertical-align:top;text-align:left}
+.docbody thead th,.docbody thead td,.docbody tr:first-child>th{background:var(--sunk);font-weight:600}
+.docbody td p,.docbody th p{margin:0 0 .4em}
+.docbody td p:last-child,.docbody th p:last-child{margin-bottom:0}
+/* FATF report boxes: case studies, examples */
+.docbody .mbox,.docbody .boxed,.docbody div.shaded{display:block;background:var(--box);border:0;border-left:3px solid var(--box-rule);
+  border-radius:2px 6px 6px 2px;padding:14px 18px;margin:.6em 0 1em;font-size:14.5px}
+.docbody table.mbox{display:table;width:100%;border-collapse:separate}
+.docbody table.mbox>*>tr>td,.docbody table.mbox>tr>td{border:0;padding:0;background:transparent;font-family:var(--serif);
+  font-size:14.5px;line-height:1.65}
+.docbody .mbox .boxtitle{font-family:var(--sans);font-weight:700;font-size:13.5px;color:var(--accent-strong);margin-bottom:.5em}
+body.dark .docbody .mbox .boxtitle{color:var(--accent)}
+.docbody td.shaded,.docbody th.shaded,.docbody tr.shaded>td{background:var(--box)}
+.docbody .tblcap{font-family:var(--sans);font-size:13px;font-weight:600}
+
 .morebar{display:flex;gap:8px;margin-top:8px}
-.morebtn{flex:1;padding:8px;border:1px dashed var(--border2);background:var(--panel2);color:var(--accent);
-  border-radius:8px;cursor:pointer;font-weight:700;font-family:inherit;font-size:12.5px}
-.morebtn:hover{border-style:solid}
+.morebtn{flex:1;padding:8px;border:1px dashed var(--rule2);background:transparent;color:var(--accent);border-radius:4px;cursor:pointer;
+  font-weight:600;font-size:13px}
+.morebtn:hover{border-style:solid;background:var(--accent-soft)}
 .morebtn.all{flex:0 0 auto;padding:8px 16px}
-.acts{white-space:nowrap;text-align:right}
-.actbtn{border:0;background:transparent;color:var(--faint);cursor:pointer;font-size:14px;
-  line-height:1;padding:2px 5px;border-radius:6px;font-family:inherit}
-.actbtn:hover{background:var(--accent-soft);color:var(--accent)}
-.actbtn.done{color:var(--good)}
-tr.dropped .actbtn{opacity:.3}
-.chipbox{flex-direction:column;gap:10px}
-.chiprow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.cmpt{border-collapse:collapse;font-size:12px;margin-top:2px}
-.cmpt td,.cmpt th{padding:3px 10px;border-bottom:1px solid var(--border);text-align:left}
-.cmpt th{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint)}
-.pat{font-size:11px;font-weight:700;padding:1px 8px;border-radius:99px}
-.pat.both{background:var(--good-soft);color:var(--good)}
-.pat.p4{background:var(--r4-soft);color:var(--r4)}
-.pat.p5{background:var(--r5-soft);color:var(--r5)}
-.pat.none{background:var(--na-soft);color:var(--na)}
-.exportrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
-.exportrow select{width:auto;padding:6px 8px;font-size:12.5px}
-.linkbtn{background:none;border:0;color:var(--accent);cursor:pointer;font-weight:700;font-size:12.5px;
-  text-decoration:underline;text-underline-offset:2px;font-family:inherit;padding:0}
-.kbd{font-family:ui-monospace,Consolas,monospace;font-size:11px;border:1px solid var(--border2);
-  border-bottom-width:2px;border-radius:4px;padding:0 4px;background:var(--panel2)}
-td.jur{font-weight:600}
+.empty{color:var(--faint);font-size:13px;padding:10px 2px}
+
+.hist{display:flex;flex-direction:column}
+.hist a{display:block;color:var(--ink);cursor:pointer;padding:7px 4px;text-decoration:none;font-size:13px;border-bottom:1px solid var(--rule);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:4px}
+.hist a:last-child{border-bottom:0}
+.hist a:hover{color:var(--accent);background:var(--surface)}
+.hist a small{color:var(--faint);margin-right:6px}
+
+.secrows{overflow-x:auto}
+@media (max-width:1080px){
+  .layout{grid-template-columns:minmax(0,1fr);padding:16px}
+  .rail{position:static;max-height:none;overflow:visible}
+  .optrow,.exgrid{grid-template-columns:1fr}
+  .covs{margin-left:0;flex-basis:100%;justify-content:flex-start}
+  .fdlg-body{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
+  .fdlg-nav{flex-direction:row;flex-wrap:wrap;border-right:0;border-bottom:1px solid var(--rule)}
+  .navtab{width:auto}
+  .navsep,.fdlg-nav .tabletoggles{display:none}
+}
+@media (max-width:640px){
+  .top{padding:0 16px;gap:10px}
+  .brandsub,.srcchip{display:none!important}
+  .composer{padding:16px}
+  .seg button{white-space:normal;line-height:1.25}
+  table.results{min-width:680px}
+  .chead .hint{margin-left:0}
+  .termhead{padding:14px 16px}
+  .termbody{padding:4px 12px 16px}
+  .fdlg-foot{flex-wrap:wrap}
+  .fdlg-foot .note{display:none}
+}
 </style>
 </head>
 <body>
-<header>
-  <div class="wordmark">
-    <div class="glyph" aria-hidden="true"></div>
+<header class="top">
+  <div class="brand">
+    <span class="brandmark" aria-hidden="true"></span>
     <div>
-      <h1>MER Search</h1>
-      <div class="eyebrow">FATF Mutual Evaluation Intelligence &nbsp;·&nbsp; __VERSION__</div>
+      <div class="brandname">MER <i>Search</i></div>
+      <div class="brandsub">FATF mutual evaluation reports, __VERSION__</div>
     </div>
   </div>
+  <span class="grow"></span>
   <div class="srcchip" id="srcChip"><span class="dot"></span><span id="srcChipTxt"></span></div>
-  <div class="spinner" id="spin" role="status" aria-label="working"></div>
+  <div class="spinner" id="spin" role="status" aria-label="Working"></div>
   <button class="iconbtn" onclick="toggleDark()" id="darkbtn">Dark mode</button>
 </header>
 
 <div class="layout">
-  <!-- ============ SIDEBAR ============ -->
-  <div class="sidebar">
-    <div class="card">
-      <h3>Data source</h3>
+  <!-- ======================= RAIL ======================= -->
+  <aside class="rail" aria-label="Source and filters">
+    <section class="panel">
+      <h2 class="ptitle">Source</h2>
       <div class="seg" id="modeSeg">
-        <button class="on" data-v="MER" onclick="setMode('MER')">MER</button>
+        <button class="on" data-v="MER" onclick="setMode('MER')">Mutual evaluations</button>
         <button data-v="OTHER" onclick="setMode('OTHER')">Other files</button>
       </div>
-      <div id="roundWrap" style="margin-top:9px">
+      <div id="roundWrap" style="margin-top:8px">
         <div class="seg" id="roundSeg">
           <button data-v="4" onclick="setRound('4')">4th round</button>
           <button class="on" data-v="5" onclick="setRound('5')">5th round</button>
-          <button data-v="both" onclick="setRound('both')">Both rounds</button>
+          <button data-v="both" onclick="setRound('both')">Both</button>
         </div>
         <div class="roundhint" id="roundHint"></div>
       </div>
-      <div id="pathBox" style="margin-top:10px">
-        <span class="pathtoggle" onclick="togglePaths()">Change source folders</span>
+      <div id="pathBox" class="pathtoggle">
+        <button class="linkbtn" onclick="togglePaths()">Change source folders</button>
         <div id="pathFields" style="display:none">
-          <label>Round 4 folder</label><input type="text" id="p4" placeholder="leave blank for the default">
-          <label>Round 5 folder</label><input type="text" id="p5" placeholder="leave blank for the default">
-          <label>Other files folder</label><input type="text" id="po" placeholder="leave blank for the default">
-          <div class="hint">Changes take effect when you click Load data.</div>
+          <label for="p4">4th round folder</label><input type="text" id="p4" placeholder="Leave blank for the default">
+          <label for="p5">5th round folder</label><input type="text" id="p5" placeholder="Leave blank for the default">
+          <label for="po">Other files folder</label><input type="text" id="po" placeholder="Leave blank for the default">
+          <div class="hint">Paste the full folder path, e.g. C:\Users\you\Documents\MER data\round_4. The tool remembers it on this computer. Changes take effect when you load the data.</div>
         </div>
       </div>
-      <button class="btn primary" style="width:100%;margin-top:12px" onclick="loadData()">Load data</button>
+      <button class="btn primary wide" style="margin-top:14px" onclick="loadData()">Load data</button>
       <div class="status" id="loadStatus">Not loaded yet.</div>
-    </div>
+    </section>
 
-    <div class="card" id="filterCard">
-      <h3>Filters</h3>
-      <label>Jurisdiction <span style="font-weight:400;color:var(--faint)">(Ctrl+click for multiple)</span></label>
-      <select multiple id="fJur"></select>
-      <label>Tables</label>
-      <label class="checkline"><input type="checkbox" id="tEff" checked><span class="swatch" style="background:var(--eff)"></span><span>Effectiveness</span></label>
-      <label class="checkline"><input type="checkbox" id="tRC" checked><span class="swatch" style="background:var(--rc)"></span><span>Risk and Context</span></label>
-      <label class="checkline"><input type="checkbox" id="tTC" checked><span class="swatch" style="background:var(--tc)"></span><span>Technical Compliance</span></label>
-      <label>Indicator / section</label>
-      <select multiple id="fInd"></select>
-      <label>Rating <span style="font-weight:400;color:var(--faint)">(effectiveness / compliance)</span></label>
-      <select multiple id="fRat"></select>
-      <label>Criteria rating</label>
-      <select multiple id="fCrit"></select>
-      <button class="btn grey" style="width:100%;margin-top:10px" onclick="clearFilters()">Clear filters</button>
-    </div>
+    <section class="panel" id="filterCard">
+      <div class="ftop">
+        <h2 class="ptitle">Filters</h2>
+        <button class="expandbtn" onclick="openFilters()" title="Open the filters in a large window">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M9.5 2.5h4v4M13.5 2.5 9 7M6.5 13.5h-4v-4M2.5 13.5 7 9"/></svg>
+          Expand
+        </button>
+      </div>
+      <div class="fsummary" id="fSummary">Searching everything in the loaded reports.</div>
+      <div class="tabletoggles" id="tableToggles">
+        <label class="ttog" style="--c:var(--eff)"><input type="checkbox" id="tEff" checked onchange="syncTables(this)"><span class="sw"></span>Effectiveness</label>
+        <label class="ttog" style="--c:var(--rc)"><input type="checkbox" id="tRC" checked onchange="syncTables(this)"><span class="sw"></span>Risk and context</label>
+        <label class="ttog" style="--c:var(--tc)"><input type="checkbox" id="tTC" checked onchange="syncTables(this)"><span class="sw"></span>Technical compliance</label>
+      </div>
+      <div id="facetRail"></div>
+      <button class="btn grey wide" style="margin-top:12px" onclick="clearFilters()">Reset filters</button>
+    </section>
 
-    <div class="card">
-      <h3>Search history</h3>
+    <section class="panel">
+      <h2 class="ptitle">Recent searches</h2>
       <div class="hist" id="hist"><div class="empty">No searches yet.</div></div>
-    </div>
-  </div>
+    </section>
+  </aside>
 
-  <!-- ============ MAIN ============ -->
-  <div class="main">
-    <div class="card">
-      <label style="margin-top:0">Search terms — one per line, no limit. Case, spacing and punctuation are ignored ("ship-based" = "ship based").<br>
-      <span style="font-weight:400;color:var(--faint)">Use <b>~</b> to treat different names as the same term: <code>FMLIT~HC fraud and ML intelligence taskforce</code>. Acronyms in brackets expand automatically: <code>JIG (Joint Intelligence Group)</code> also finds JIG and the full name on their own.</span></label>
-      <textarea id="terms" placeholder="ship-based casino&#10;cruise&#10;FMLIT~HC fraud and ML intelligence taskforce&#10;JIG (Joint Intelligence Group)"></textarea>
-      <div class="termcount" id="termCount">0 terms ready &nbsp;·&nbsp; no limit</div>
-      <span class="hint" style="margin-left:8px"><span class="kbd">Ctrl</span> + <span class="kbd">Enter</span> searches</span>
-
-      <label>Search mode</label>
-      <div class="seg" id="smSeg" style="max-width:420px">
-        <button class="on" data-v="strict" onclick="setSM('strict')">Strict keyword</button>
-        <button data-v="exact" onclick="setSM('exact')">Exact phrase</button>
-        <button data-v="fuzzy" onclick="setSM('fuzzy')">Fuzzy</button>
+  <!-- ======================= MAIN ======================= -->
+  <main class="main">
+    <section class="composer">
+      <div class="eyebrow">FATF mutual evaluation reports</div>
+      <h1 class="ctitle">Search the <i>evaluations</i></h1>
+      <div class="chead">
+        <label for="terms">Search terms, one per line</label>
+        <span class="termcount" id="termCount">0 terms</span>
+        <span class="hint"><span class="kbd">Ctrl</span> + <span class="kbd">Enter</span> to search</span>
       </div>
-      <div class="hint" id="smHint">Words must start with your term — "ship" finds ships and shipping, never membership.</div>
-      <div id="thresholdWrap">
-        <label style="margin-top:0">Fuzzy similarity: <span id="thVal" style="color:var(--accent);font-weight:700">85</span>%</label>
-        <input type="range" min="70" max="100" value="85" id="threshold"
-               oninput="document.getElementById('thVal').textContent=this.value">
-        <div class="hint">Lower = catches more typos but more noise. Filter by jurisdiction to keep fuzzy fast on round 4.</div>
+      <textarea id="terms" spellcheck="false" placeholder="beneficial ownership&#10;DPMS~dealers in precious metals and stones&#10;JIG (Joint Intelligence Group)&#10;ship-based casino"></textarea>
+      <details class="syntax">
+        <summary>How terms are matched</summary>
+        <table>
+          <tr><td><code>beneficial ownership</code></td><td>The words in this order. Case, spacing, hyphens, punctuation and accents are ignored.</td></tr>
+          <tr><td><code>ship</code></td><td>Words that start with "ship" (ships, shipping), never "membership".</td></tr>
+          <tr><td><code>DPMS~dealers in precious metals</code></td><td><code>~</code> joins names for the same thing into one result.</td></tr>
+          <tr><td><code>JIG (Joint Intelligence Group)</code></td><td>JIG, the full name, or either bracketed form.</td></tr>
+          <tr><td><code>SAMLIT (South Africa)</code></td><td>SAMLIT, in South Africa's report only.</td></tr>
+          <tr><td><code>JMLIT+</code></td><td>Only "JMLIT+", not plain JMLIT.</td></tr>
+        </table>
+      </details>
+
+      <div class="optrow">
+        <div>
+          <label>Search mode</label>
+          <div class="seg" id="smSeg">
+            <button class="on" data-v="strict" onclick="setSM('strict')">Strict keyword</button>
+            <button data-v="exact" onclick="setSM('exact')">Exact phrase</button>
+            <button data-v="fuzzy" onclick="setSM('fuzzy')">Fuzzy</button>
+          </div>
+          <div class="hint" id="smHint">Words must start with your term: "ship" finds ships and shipping, never membership.</div>
+          <div id="thresholdWrap">
+            <label for="threshold" style="margin-top:0">Fuzzy similarity: <span id="thVal" style="color:var(--accent)">85</span>%</label>
+            <input type="range" min="70" max="100" value="85" id="threshold"
+                   oninput="document.getElementById('thVal').textContent=this.value">
+            <div class="hint">Lower catches more typos but also more noise. Filter by jurisdiction to keep fuzzy fast on the 4th round.</div>
+          </div>
+        </div>
+        <div>
+          <label>Acronyms</label>
+          <label class="checkline" style="margin-top:4px"><input type="checkbox" id="capsOnly">
+            <span>Match all-caps terms in capitals only, so ASC finds "ASC" but not "ascertain"</span></label>
+        </div>
       </div>
 
-      <label class="checkline" style="margin-top:10px"><input type="checkbox" id="capsOnly">
-        <span>Match ALL-CAPS terms in capitals only (ASC finds "ASC" but not "ascertain" or "asc")</span></label>
-
-      <label>Report name <span style="font-weight:400;color:var(--faint)">(used in the file name and as the report title; blank uses the first search term)</span></label>
-      <input type="text" id="reportName" placeholder="e.g. DPMS in the 4th and 5th rounds">
-
-      <label>Export folder</label>
-      <input type="text" id="exportDir" value="__DEFAULT_EXPORT__">
-      <div class="hint" id="fileNamePreview"></div>
-
-      <div class="row" style="margin-top:14px">
+      <div class="actions">
         <button class="btn primary" id="btnSearch" onclick="doSearch()">Search</button>
         <button class="btn ghost" id="btnCheck" onclick="doInterpret()">Check my terms</button>
         <button class="btn grey" onclick="clearAll()">Clear</button>
-      </div>
-      <div class="exportrow">
-        <button class="btn ghost" id="btnExportX" onclick="doExport('xlsx')" disabled>Export Excel</button>
-        <button class="btn ghost" id="btnExportW" onclick="doExport('docx')" disabled>Export Word report</button>
-        <button class="btn ghost" id="btnExportB" onclick="doExport('both')" disabled>Both</button>
-        <select id="quoteStyle" title="How quotes appear in the Excel and Word exports">
-          <option value="paragraph">Quotes in exports: full paragraph</option>
-          <option value="sentence">Quotes in exports: sentence only (much smaller files)</option>
-        </select>
       </div>
       <div class="progwrap" id="progWrap"><div class="progbar"><div class="progfill" id="progFill"></div></div>
         <div class="progtxt" id="progTxt"></div></div>
       <div class="status" id="searchStatus"></div>
       <div id="interp"></div>
-    </div>
 
-    <div id="results" style="margin-top:16px">
-      <div class="welcome">
-        <div class="biglyph">MER</div>
-        Load a data source on the left, enter your terms, and search.<br>
-        Every term gets its own results card with jurisdiction coverage for each round.
+      <div class="exportbox">
+        <h3 class="eyebrow">Export</h3>
+        <div class="exgrid">
+          <div>
+            <label for="reportName">Report name <span class="opt">(title and file name; blank uses the first term)</span></label>
+            <input type="text" id="reportName" placeholder="e.g. DPMS in the 4th and 5th rounds">
+          </div>
+          <div>
+            <label for="exportDir">Export folder</label>
+            <input type="text" id="exportDir" value="__DEFAULT_EXPORT__">
+          </div>
+        </div>
+        <div class="hint" id="fileNamePreview"></div>
+        <div class="exportrow">
+          <button class="btn ghost" id="btnExportX" onclick="doExport('xlsx')" disabled>Export Excel</button>
+          <button class="btn ghost" id="btnExportW" onclick="doExport('docx')" disabled>Export Word report</button>
+          <button class="btn ghost" id="btnExportB" onclick="doExport('both')" disabled>Export both</button>
+          <select id="quoteStyle" title="How quotes appear in the Excel and Word exports" aria-label="Quote style in exports">
+            <option value="paragraph">Quotes: full paragraph</option>
+            <option value="sentence">Quotes: sentence only (much smaller files)</option>
+          </select>
+        </div>
       </div>
-    </div>
-  </div>
+    </section>
+
+    <div id="results"></div>
+  </main>
 </div>
+
+<!-- ======================= FILTERS POP-OUT ======================= -->
+<dialog class="fdlg" id="fdlg" aria-labelledby="fdlgTitle">
+  <div class="fdlg-head">
+    <div>
+      <h2 id="fdlgTitle">Choose <i>what to search</i></h2>
+      <p id="dlgSummary"></p>
+    </div>
+    <span class="sp"></span>
+    <button class="iconbtn" id="dlgMax" onclick="toggleMax()">Full screen</button>
+    <button class="iconbtn" onclick="closeFilters()" aria-label="Close filters">Close</button>
+  </div>
+  <div class="fdlg-body">
+    <nav class="fdlg-nav" id="dlgNav" aria-label="Filter groups"></nav>
+    <section class="fdlg-pane">
+      <div class="fdlg-tools">
+        <input type="search" id="dlgSearch" placeholder="Find…" aria-label="Find in this filter">
+        <button class="mini" id="dlgAll" onclick="facetAll(curTab,true)">Select all</button>
+        <button class="mini" id="dlgNone" onclick="facetAll(curTab,false)">Deselect all</button>
+        <button class="mini" onclick="facetInvert(curTab)">Invert</button>
+        <button class="mini" onclick="setTree(curTab,true)">Expand groups</button>
+        <button class="mini" onclick="setTree(curTab,false)">Collapse groups</button>
+        <label class="checkline"><input type="checkbox" id="dlgOnly"> Show selected only</label>
+      </div>
+      <div class="presets" id="dlgPresets"></div>
+      <div class="fdlg-list" id="dlgList"></div>
+    </section>
+  </div>
+  <div class="fdlg-foot">
+    <button class="btn grey" onclick="clearFilters()">Reset all filters</button>
+    <span class="note" id="dlgFootNote">Filters apply to your next search.</span>
+    <button class="btn ghost" id="dlgRerun" onclick="closeFilters();doSearch()" style="display:none">Search again with these filters</button>
+    <button class="btn primary" onclick="closeFilters()">Done</button>
+  </div>
+</dialog>
 
 <script>
 const PAGE=__PAGE_SIZE__;
@@ -2663,6 +3161,9 @@ let cards={};
 const RLAB={'4':'4th round','5':'5th round','both':'4th and 5th rounds'};
 const RCLS={'4th round':'r4','5th round':'r5'};
 const RSHORT={'4th round':'4th','5th round':'5th'};
+const WELCOME='<div class="welcome"><h2>Every hit, <i>in context</i></h2>'
+  +'<p>Load a source on the left, type your terms and search. Each term gets its own card with jurisdiction coverage, '
+  +'and every hit opens to the paragraph as it appears in the report, tables and boxes included.</p></div>';
 
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -2671,12 +3172,13 @@ async function post(url,body){
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   return r.json();
 }
+function plural(n,w){return n.toLocaleString()+' '+w+(n===1?'':'s');}
 function fileNamePreview(){
   const n=($('reportName').value||'').trim();
   const t=($('terms').value.split('\n').map(x=>x.trim()).filter(Boolean)[0]||'search');
   const d=new Date(); const ds=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-  $('fileNamePreview').innerHTML='Will save as:  '+esc(ds+'_'+(n||t)+'_FATF Search tool')+'.xlsx / .docx'
-    +' &nbsp; <button class="linkbtn" onclick="openFolder()">Open export folder</button>';
+  $('fileNamePreview').innerHTML='Saves as '+esc(ds+'_'+(n||t)+'_FATF Search tool')+'.xlsx / .docx. '
+    +'<button class="linkbtn" onclick="openFolder()">Open export folder</button>';
 }
 function togglePaths(){const f=$('pathFields');f.style.display=(f.style.display==='none'?'block':'none');}
 
@@ -2688,35 +3190,201 @@ function setMode(v){if(v===dataMode)return;dataMode=v;segSet('modeSeg',v);
 function setRound(v){if(v===round&&loaded)return;round=v;segSet('roundSeg',v);roundHint();loaded=false;setChip(null);loadData();}
 function roundHint(){
   const h={'4':'4th round reports (2013 Methodology).','5':'5th round reports (2022 Methodology) published so far.',
-    'both':'Both rounds searched together. Every hit is labelled with its round and every statistic is shown per round &mdash; the rounds are never added together.'};
-  $('roundHint').innerHTML=h[round]||'';}
+    'both':'Both rounds searched together. Every hit is labelled with its round, and every statistic is shown per round, never added together.'};
+  $('roundHint').textContent=h[round]||'';}
 function setSM(v){searchMode=v;segSet('smSeg',v);
-  $('thresholdWrap').style.display=(v==='fuzzy')?'':'none';
-  const hints={strict:'Words must start with your term — "ship" finds ships and shipping, never membership.',
-    exact:'Whole words only — "ship" will not match ships or shipping.',
-    fuzzy:'Catches typos and close spellings ("cassino" ≈ "casino"). Slower on large tables.'};
+  $('thresholdWrap').style.display=(v==='fuzzy')?'block':'none';
+  const hints={strict:'Words must start with your term: "ship" finds ships and shipping, never membership.',
+    exact:'Whole words only: "ship" will not match ships or shipping.',
+    fuzzy:'Catches typos and close spellings ("cassino" finds "casino"). Slower on large tables.'};
   $('smHint').textContent=hints[v];}
 function spin(on){$('spin').style.display=on?'inline-block':'none';}
 function toggleDark(){document.body.classList.toggle('dark');
   const d=document.body.classList.contains('dark');
   $('darkbtn').textContent=d?'Light mode':'Dark mode';
   try{localStorage.setItem('fatf_dark',d?'1':'0');}catch(e){}}
-try{if(localStorage.getItem('fatf_dark')==='1')toggleDark();}catch(e){}
+try{const pref=localStorage.getItem('fatf_dark');
+  if(pref==='1'||(pref===null&&window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches))toggleDark();}catch(e){}
 function setChip(txt){const c=$('srcChip');
   if(!txt){c.style.display='none';return}
   $('srcChipTxt').textContent=txt;c.style.display='flex';}
+function paths(){return {round_4:$('p4').value.trim(),round_5:$('p5').value.trim(),other:$('po').value.trim()};}
+/* folders typed here are remembered on this computer, so data kept outside
+   the tool's folder only has to be pointed to once */
+function restorePaths(){
+  try{const p=JSON.parse(localStorage.getItem('fatf_paths')||'{}');
+    $('p4').value=p.round_4||'';$('p5').value=p.round_5||'';$('po').value=p.other||'';
+    if(p.round_4||p.round_5||p.other)$('pathFields').style.display='block';}catch(e){}
+  ['p4','p5','po'].forEach(id=>$(id).addEventListener('change',()=>{
+    try{localStorage.setItem('fatf_paths',JSON.stringify(paths()));}catch(e){}}));}
 
-function fillSelect(id,vals){const s=$(id);const keep=new Set(Array.from(s.selectedOptions).map(o=>o.value));s.innerHTML='';
-  vals.forEach(v=>{const o=document.createElement('option');
-    if(v&&typeof v==='object'){o.value=v.code;o.textContent=v.label;}
-    else{o.value=v;o.textContent=v;}
-    if(keep.has(o.value))o.selected=true;
-    s.appendChild(o);});}
-function selVals(id){return Array.from($(id).selectedOptions).map(o=>o.value);}
-function clearFilters(){['fJur','fInd','fRat','fCrit'].forEach(id=>$(id).selectedIndex=-1);
-  ['tEff','tRC','tTC'].forEach(id=>$(id).checked=true);}
-function paths(){return {round_4:$('p4').value,round_5:$('p5').value,other:$('po').value};}
+/* =====================================================================
+   Filters: one state, drawn in the rail and in the pop-out
+   ===================================================================== */
+const FDEF=[
+  {k:'jur', title:'Jurisdictions', noun:'jurisdiction', ph:'Find a jurisdiction'},
+  {k:'ind', title:'Sections', noun:'section', ph:'Find an IO, recommendation or criterion, e.g. IO.6 or C.20'},
+  {k:'rat', title:'Ratings', noun:'rating', ph:'Find a rating', hint:'Effectiveness or compliance rating'},
+  {k:'crit',title:'Criterion ratings', noun:'criterion rating', ph:'Find a criterion rating'}];
+const F={};
+FDEF.forEach(d=>F[d.k]=Object.assign({},d,{tree:[],values:[],sel:new Set(),q:'',presets:[],gidx:{},openI:{},openD:{}}));
+let LABELS={}, curTab='jur', gseq=0;
 
+function lab(k,v){return (k==='rat'||k==='crit')?(LABELS[v]||v):v;}
+function setFacet(k,data){
+  const f=F[k];
+  const wasAll=!f.values.length||f.sel.size===f.values.length;
+  f.tree=(data&&data.tree)||[];f.presets=(data&&data.presets)||[];f.gidx={};
+  const vals=[];
+  const walk=n=>{n._g='g'+(++gseq);let its=[];
+    (n.items||[]).forEach(v=>{its.push(v);vals.push(v);});
+    (n.children||[]).forEach(c=>{its=its.concat(walk(c));});
+    f.gidx[n._g]=its;return its;};
+  f.tree.forEach(walk);
+  f.values=[...new Set(vals)];
+  if(wasAll)f.sel=new Set(f.values);
+  else{f.sel=new Set(f.values.filter(v=>f.sel.has(v)));if(!f.sel.size)f.sel=new Set(f.values);}
+}
+function facetVals(k){const f=F[k];return (!f.values.length||f.sel.size===f.values.length)?[]:[...f.sel];}
+function countText(k){const f=F[k],n=f.sel.size,t=f.values.length;
+  if(!t)return {t:'None loaded',c:''};
+  if(n===t)return {t:'All '+t,c:''};
+  if(!n)return {t:'None selected',c:'none'};
+  return {t:n+' of '+t,c:'some'};}
+function qmatch(s,q){return !q||String(s).toLowerCase().includes(q);}
+function hlq(s,q){const e=esc(s);if(!q)return e;
+  const i=String(s).toLowerCase().indexOf(q);if(i<0)return e;
+  return esc(String(s).slice(0,i))+'<span class="q">'+esc(String(s).slice(i,i+q.length))+'</span>'+esc(String(s).slice(i+q.length));}
+
+function itemVisible(k,v,q,groupHit,ctx){
+  const f=F[k];
+  if(ctx==='D'&&$('dlgOnly').checked&&!f.sel.has(v))return false;
+  return groupHit||qmatch(lab(k,v),q);}
+function itemHtml(k,v,q){
+  const on=F[k].sel.has(v);
+  return '<label class="fitem'+(on?'':' off')+'"><input type="checkbox" data-v="'+esc(v)+'"'+(on?' checked':'')+'><span>'+hlq(lab(k,v),q)+'</span></label>';}
+function nodeHtml(k,n,depth,ctx,q,parentHit){
+  const f=F[k];
+  const hit=parentHit||!!(q&&n.name&&qmatch(n.name,q));
+  const items=(n.items||[]).filter(v=>itemVisible(k,v,q,hit,ctx));
+  const kids=(n.children||[]).map(c=>nodeHtml(k,c,depth+1,ctx,q,hit)).filter(Boolean);
+  if(!items.length&&!kids.length)return '';
+  const itemsHtml=items.length?'<div class="fitems">'+items.map(v=>itemHtml(k,v,q)).join('')+'</div>':'';
+  if(!n.name)return itemsHtml+kids.join('');
+  const all=f.gidx[n._g]||[];const nsel=all.filter(v=>f.sel.has(v)).length;
+  const om=ctx==='D'?f.openD:f.openI;
+  const def=ctx==='D'?true:(depth===0);
+  const open=(q||(ctx==='D'&&$('dlgOnly').checked))?true:(n._g in om?om[n._g]:def);
+  return '<div class="fgroup'+(open?' open':'')+'"><div class="fghead">'
+    +'<button class="fcaret" data-tog="'+n._g+'" aria-expanded="'+open+'" aria-label="Show or hide '+esc(n.name)+'"></button>'
+    +'<label class="fgcheck"><input type="checkbox" data-g="'+n._g+'"'+(nsel===all.length?' checked':'')+(nsel&&nsel<all.length?' data-ind="1"':'')+'>'
+    +'<span class="fgname">'+hlq(n.name,hit&&!parentHit?q:'')+'</span></label>'
+    +'<span class="fgcount">'+nsel+'/'+all.length+'</span></div>'
+    +(open?'<div class="fgbody">'+itemsHtml+kids.join('')+'</div>':'')+'</div>';}
+function treeHtml(k,ctx){
+  const f=F[k];const q=(f.q||'').trim().toLowerCase();
+  const h=f.tree.map(n=>nodeHtml(k,n,0,ctx,q,false)).join('');
+  if(h)return h;
+  if(!f.values.length)return '<div class="fempty">Load the data to see the options.</div>';
+  return '<div class="fempty">Nothing matches '+(q?'"'+esc(q)+'"':'this view')+'.</div>';}
+function paintIndeterminate(el){el.querySelectorAll('input[data-ind]').forEach(i=>i.indeterminate=true);}
+
+function buildRail(){
+  $('facetRail').innerHTML=FDEF.map(d=>
+    '<div class="facet'+(d.k==='jur'?'':' closed')+'" id="fx_'+d.k+'">'
+    +'<button class="facet-head" onclick="this.parentNode.classList.toggle(\'closed\')"><span class="caret"></span>'
+    +'<span>'+esc(d.title)+'</span><span class="facet-count" id="fc_'+d.k+'"></span></button>'
+    +'<div class="facet-body"><div class="facet-tools">'
+    +'<input type="search" class="fsearch" data-f="'+d.k+'" placeholder="'+esc(d.ph.split(',')[0])+'" aria-label="'+esc(d.ph)+'">'
+    +'<button class="mini" onclick="facetAll(\''+d.k+'\',true)" title="Select all shown">All</button>'
+    +'<button class="mini" onclick="facetAll(\''+d.k+'\',false)" title="Deselect all shown">None</button>'
+    +'<button class="mini" onclick="openFilters(\''+d.k+'\')" title="Open in the large window">Expand</button></div>'
+    +'<div class="flist" id="fl_'+d.k+'" data-f="'+d.k+'" data-ctx="I"></div></div></div>').join('');
+  document.querySelectorAll('.fsearch').forEach(inp=>inp.addEventListener('input',()=>{
+    const k=inp.dataset.f;F[k].q=inp.value;if(curTab===k&&$('fdlg').open)$('dlgSearch').value=inp.value;refreshFacet(k);}));
+  FDEF.forEach(d=>bindList($('fl_'+d.k)));
+  bindList($('dlgList'));
+}
+function bindList(el){
+  el.addEventListener('change',e=>{
+    const t=e.target;const k=el.dataset.f;const f=F[k];if(!f||t.type!=='checkbox')return;
+    if(t.dataset.v!==undefined){t.checked?f.sel.add(t.dataset.v):f.sel.delete(t.dataset.v);}
+    else if(t.dataset.g){const its=f.gidx[t.dataset.g]||[];
+      const allOn=its.every(v=>f.sel.has(v));its.forEach(v=>allOn?f.sel.delete(v):f.sel.add(v));}
+    refreshFacet(k);});
+  el.addEventListener('click',e=>{
+    const b=e.target.closest('[data-tog]');if(!b)return;
+    const k=el.dataset.f;const f=F[k];const om=el.dataset.ctx==='D'?f.openD:f.openI;
+    om[b.dataset.tog]=b.getAttribute('aria-expanded')!=='true';refreshFacet(k);});
+}
+function refreshFacet(k){
+  const rl=$('fl_'+k);
+  if(rl){const st=rl.scrollTop;rl.innerHTML=treeHtml(k,'I');paintIndeterminate(rl);rl.scrollTop=st;}
+  const c=countText(k);const fc=$('fc_'+k);if(fc){fc.textContent=c.t;fc.className='facet-count '+c.c;}
+  if($('fdlg').open){
+    if(k===curTab){const L=$('dlgList');const st=L.scrollTop;L.dataset.f=k;L.innerHTML=treeHtml(k,'D');paintIndeterminate(L);L.scrollTop=st;}
+    renderNav();
+  }
+  renderSummary();
+}
+function refreshAll(){FDEF.forEach(d=>refreshFacet(d.k));}
+function shownValues(k,ctx){
+  const f=F[k];const q=(f.q||'').trim().toLowerCase();const out=new Set();
+  const walk=(n,ph)=>{const hit=ph||!!(q&&n.name&&qmatch(n.name,q));
+    (n.items||[]).forEach(v=>{if(itemVisible(k,v,q,hit,ctx))out.add(v);});(n.children||[]).forEach(c=>walk(c,hit));};
+  f.tree.forEach(n=>walk(n,false));return out;}
+function facetAll(k,on){
+  const f=F[k];const ctx=($('fdlg').open&&k===curTab)?'D':'I';
+  const vis=(f.q||(ctx==='D'&&$('dlgOnly').checked))?shownValues(k,ctx):new Set(f.values);
+  vis.forEach(v=>on?f.sel.add(v):f.sel.delete(v));refreshFacet(k);}
+function facetInvert(k){const f=F[k];f.sel=new Set(f.values.filter(v=>!f.sel.has(v)));refreshFacet(k);}
+function setTree(k,open){const f=F[k];Object.keys(f.gidx).forEach(g=>f.openD[g]=open);refreshFacet(k);}
+function applyPreset(k,i){const f=F[k];const p=f.presets[i];if(!p)return;
+  f.sel=new Set(p.items.filter(v=>f.values.includes(v)));refreshFacet(k);}
+function syncTables(src){
+  if(src){document.querySelectorAll('input[data-mirror="'+src.id+'"]').forEach(m=>m.checked=src.checked);}
+  renderSummary();}
+function mirrorTable(m){const src=$(m.dataset.mirror);src.checked=m.checked;syncTables(src);}
+function tablesOn(){return [['tEff','Effectiveness'],['tRC','Risk and Context'],['tTC','Technical Compliance']].filter(x=>$(x[0]).checked).map(x=>x[1]);}
+function summaryText(){
+  const parts=[];
+  FDEF.forEach(d=>{const f=F[d.k];if(f.values.length&&f.sel.size!==f.values.length)
+    parts.push(f.sel.size?plural(f.sel.size,d.noun)+' of '+f.values.length:'no '+d.noun+'s');});
+  const tb=tablesOn();if(tb.length<3)parts.push(tb.length?tb.join(' and ').toLowerCase()+' only':'no tables');
+  return parts.length?'Narrowed to '+parts.join(', ')+'.':'Searching everything in the loaded reports.';}
+function renderSummary(){const s=summaryText();$('fSummary').textContent=s;if($('fdlg').open)$('dlgSummary').textContent=s;}
+function renderNav(){
+  const tb=[['tEff','Effectiveness','--eff'],['tRC','Risk and context','--rc'],['tTC','Technical compliance','--tc']];
+  $('dlgNav').innerHTML=FDEF.map(d=>{const c=countText(d.k);
+    return '<button class="navtab'+(d.k===curTab?' on':'')+'" onclick="showTab(\''+d.k+'\')"><b>'+esc(d.title)+'</b>'
+      +'<span class="'+c.c+'">'+esc(c.t)+'</span></button>';}).join('')
+    +'<div class="navsep">Tables</div><div class="tabletoggles">'
+    +tb.map(t=>'<label class="ttog" style="--c:var('+t[2]+')"><input type="checkbox" data-mirror="'+t[0]+'"'+($(t[0]).checked?' checked':'')
+      +' onchange="mirrorTable(this)"><span class="sw"></span>'+t[1]+'</label>').join('')+'</div>';}
+function showTab(k){
+  curTab=k;const f=F[k];const d=FDEF.find(x=>x.k===k);
+  $('dlgSearch').value=f.q||'';$('dlgSearch').placeholder=d.ph;
+  $('dlgPresets').innerHTML=f.presets.length?'Quick picks: '+f.presets.map((p,i)=>
+    '<button class="preset" onclick="applyPreset(\''+k+'\','+i+')" title="Select exactly these">'+esc(p.name)+'<small>'+p.items.length+'</small></button>').join(''):'';
+  refreshFacet(k);}
+function openFilters(k){
+  const dlg=$('fdlg');
+  if(!dlg.open){if(dlg.showModal)dlg.showModal();else dlg.setAttribute('open','');}
+  $('dlgRerun').style.display=lastPayload?'':'none';
+  showTab(k||curTab);renderSummary();
+  setTimeout(()=>$('dlgSearch').focus(),30);}
+function closeFilters(){const dlg=$('fdlg');if(dlg.open){if(dlg.close)dlg.close();else dlg.removeAttribute('open');}}
+function toggleMax(){const d=$('fdlg');d.classList.toggle('max');$('dlgMax').textContent=d.classList.contains('max')?'Exit full screen':'Full screen';}
+function clearFilters(){
+  FDEF.forEach(d=>{const f=F[d.k];f.sel=new Set(f.values);f.q='';});
+  document.querySelectorAll('.fsearch').forEach(i=>i.value='');$('dlgSearch').value='';
+  ['tEff','tRC','tTC'].forEach(id=>$(id).checked=true);
+  if($('fdlg').open)renderNav();
+  refreshAll();}
+
+/* =====================================================================
+   Loading
+   ===================================================================== */
 async function loadData(){
   spin(true);
   const st=$('loadStatus');
@@ -2728,18 +3396,23 @@ async function loadData(){
     if(!j.ok){st.textContent='Could not load: '+j.error;st.classList.add('err');loaded=false;return;}
     loaded=true;loadedKey=key;
     if(dataMode==='MER'){
-      st.textContent=j.rounds.map(r=>'Loaded '+r.round+' — '+r.rows.toLocaleString()+' paragraphs, '
+      st.textContent=j.rounds.map(r=>r.round+': '+r.rows.toLocaleString()+' paragraphs, '
         +r.n_jurisdictions+' jurisdictions\n'
-        +Object.entries(r.counts).map(([k,v])=>'  • '+k+': '+v.toLocaleString()).join('\n')).join('\n');
-      fillSelect('fJur',j.jurisdictions);fillSelect('fInd',j.indicators);
-      fillSelect('fRat',j.ratings);fillSelect('fCrit',j.crit_ratings);
+        +Object.entries(r.counts).map(([k,v])=>'  '+k+': '+v.toLocaleString()).join('\n')).join('\n');
+      LABELS=j.labels||{};
+      const fx=j.facets||{
+        jur:{tree:[{name:'',items:j.jurisdictions}]},ind:{tree:[{name:'',items:j.indicators}]},
+        rat:{tree:[{name:'',items:j.ratings.map(r=>r.code)}]},crit:{tree:[{name:'',items:j.crit_ratings.map(r=>r.code)}]}};
+      FDEF.forEach(d=>setFacet(d.k,fx[d.k]));
+      refreshAll();
+      if($('fdlg').open)showTab(curTab);
       if(j.rounds.length===2)
-        setChip('4th + 5th round · '+j.rounds[0].n_jurisdictions+' + '+j.rounds[1].n_jurisdictions+' jurisdictions');
-      else setChip(j.rounds[0].round+' · '+j.n_jurisdictions+' jurisdictions · '+j.total.toLocaleString()+' paragraphs');
+        setChip('4th and 5th rounds, '+j.rounds[0].n_jurisdictions+' and '+j.rounds[1].n_jurisdictions+' jurisdictions');
+      else setChip(j.rounds[0].round+', '+j.n_jurisdictions+' jurisdictions, '+j.total.toLocaleString()+' paragraphs');
     }else{
-      st.textContent='Loaded other files:\n'+j.files.map(f=>'  • '+f.file+' — '+
-        (f.error?('NOT READABLE: '+f.error):(f.rows.toLocaleString()+' searchable pieces'))).join('\n');
-      setChip('Other files · '+j.files.length+' file'+(j.files.length===1?'':'s'));
+      st.textContent='Other files:\n'+j.files.map(f=>'  '+f.file+': '+
+        (f.error?('not readable ('+f.error+')'):(f.rows.toLocaleString()+' searchable pieces'))).join('\n');
+      setChip('Other files, '+plural(j.files.length,'file'));
     }
   }catch(e){st.textContent='Could not load: '+e;st.classList.add('err');loaded=false;}
   finally{spin(false);}
@@ -2747,9 +3420,6 @@ async function loadData(){
 
 function payload(){
   const terms=$('terms').value.split('\n').map(t=>t.trim()).filter(Boolean);
-  const tables=[];if($('tEff').checked)tables.push('Effectiveness');
-  if($('tRC').checked)tables.push('Risk and Context');
-  if($('tTC').checked)tables.push('Technical Compliance');
   return{data_mode:dataMode,round:round,terms:terms,search_mode:searchMode,
     caps_only:$('capsOnly').checked,
     report_name:$('reportName').value,
@@ -2758,18 +3428,83 @@ function payload(){
     threshold:$('threshold').value,
     export_dir:$('exportDir').value,
     quote_style:$('quoteStyle').value,
-    filters:{jurisdictions:selVals('fJur'),tables:tables,indicators:selVals('fInd'),
-             ratings:selVals('fRat'),crit_ratings:selVals('fCrit')}};
+    filters:{jurisdictions:facetVals('jur'),tables:tablesOn(),indicators:facetVals('ind'),
+             ratings:facetVals('rat'),crit_ratings:facetVals('crit')}};
 }
+function filterProblem(){
+  if(dataMode!=='MER')return null;
+  for(const d of FDEF){const f=F[d.k];if(f.values.length&&!f.sel.size)return {k:d.k,msg:'No '+d.noun+'s are selected. Tick at least one, or select all.'};}
+  if(!tablesOn().length)return {k:curTab,msg:'No tables are selected. Turn on at least one of Effectiveness, Risk and context or Technical compliance.'};
+  return null;}
 
+/* =====================================================================
+   Highlighting
+   ===================================================================== */
+function reEsc(s){return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
 function hl(text,matched,variants){
   let vs=(variants&&variants.length)?variants.slice():(matched?[matched]:[]);
   vs=vs.filter(Boolean).sort((a,b)=>b.length-a.length);
   const e=esc(text);
   if(!vs.length)return e;
-  const alt=vs.map(v=>esc(v).replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|');
+  const alt=vs.map(v=>reEsc(esc(v))).join('|');
   return e.replace(new RegExp(alt,'gi'),x=>'<mark>'+x+'</mark>');
 }
+/* Mark the matched wording inside rendered HTML, even where it crosses
+   a tag (a bold word, a table cell) or the report uses a non-breaking space. */
+function markDom(root,matched,variants){
+  let vs=(variants&&variants.length)?variants.slice():(matched?[matched]:[]);
+  vs=vs.filter(Boolean).sort((a,b)=>b.length-a.length);
+  if(!vs.length)return 0;
+  const re=new RegExp(vs.map(v=>reEsc(v.trim()).replace(/\s+/g,'[\\s\\u00a0]*')).join('|'),'gi');
+  const nodes=[];let full='';
+  const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);let n;
+  while((n=w.nextNode())){nodes.push({n:n,s:full.length});full+=n.nodeValue;}
+  const ranges=[];let m;
+  while((m=re.exec(full))){if(!m[0].length){re.lastIndex++;continue;}ranges.push([m.index,m.index+m[0].length]);}
+  for(let i=nodes.length-1;i>=0;i--){
+    const node=nodes[i].n,s=nodes[i].s,e=s+node.nodeValue.length;
+    const segs=ranges.filter(r=>r[0]<e&&r[1]>s).map(r=>[Math.max(r[0],s)-s,Math.min(r[1],e)-s]);
+    for(let j=segs.length-1;j>=0;j--){
+      const a=segs[j][0],b=segs[j][1];if(b<=a)continue;
+      node.splitText(b);const mid=node.splitText(a);
+      if(!mid.nodeValue.trim())continue;
+      const mk=document.createElement('mark');mid.parentNode.insertBefore(mk,mid);mk.appendChild(mid);}
+  }
+  return ranges.length;
+}
+/* Give the report's own structures their shape: single-cell tables are
+   FATF "boxes" (case studies, examples); wide tables scroll sideways. */
+function shapeDoc(body){
+  body.querySelectorAll('table').forEach(t=>{
+    const cells=t.querySelectorAll(':scope>tr>td,:scope>tr>th,:scope>*>tr>td,:scope>*>tr>th');
+    const firstText=(t.textContent||'').trim();
+    if(cells.length===1||(t.classList.contains('shaded')&&cells.length<=2)||/^Box\s+\d/i.test(firstText)&&cells.length<=2){
+      t.classList.add('mbox');
+    }else if(!t.closest('.tblwrap')){
+      const wrap=document.createElement('div');wrap.className='tblwrap';t.parentNode.insertBefore(wrap,t);wrap.appendChild(t);
+    }
+  });
+  body.querySelectorAll('.mbox,.boxed,div.shaded').forEach(b=>{
+    const first=b.querySelector('p,div,b,strong');
+    if(first&&/^\s*Box\s+\d/i.test(first.textContent||''))first.classList.add('boxtitle');
+  });
+  body.querySelectorAll('p').forEach(p=>{
+    const t=(p.textContent||'').trim();
+    if(/^(Table|Figure|Chart)\s+\d[\d.]*\.?\s/i.test(t)&&t.length<220&&p.nextElementSibling&&
+       (p.nextElementSibling.matches('table,.tblwrap')))p.classList.add('tblcap');
+  });
+}
+function fmtTags(html){
+  if(!html)return '';
+  const tags=[];
+  const nTables=(html.match(/<table/gi)||[]).length;
+  const isBox=/class="[^"]*boxed/.test(html)||/Box\s+\d/.test(html);
+  if(isBox)tags.push('Box');
+  if(nTables&&!(isBox&&nTables===1))tags.push(nTables>1?nTables+' tables':'Table');
+  if(/<(ul|ol)[\s>]/i.test(html))tags.push('List');
+  return tags.map(t=>'<span class="fmt">'+t+'</span>').join('');
+}
+
 function pillClass(rating){
   const code=(rating||'').split(' ')[0].toUpperCase();
   if(['C','HE','M'].includes(code))return 'good';
@@ -2778,7 +3513,7 @@ function pillClass(rating){
   if(['NC','LE','NM'].includes(code))return 'bad';
   return 'na';
 }
-function pill(rating){if(!rating)return'';return '<span class="pill '+pillClass(rating)+'">'+esc(rating)+'</span>';}
+function pill(rating){if(!rating)return'';return '<span class="pill '+pillClass(rating)+'" title="'+esc(LABELS[rating]||rating)+'">'+esc(rating)+'</span>';}
 function rtag(lab){return '<span class="rtag '+(RCLS[lab]||'')+'">'+esc(RSHORT[lab]||lab)+'</span>';}
 
 async function doInterpret(){
@@ -2789,16 +3524,16 @@ async function doInterpret(){
     const j=await post('/api/interpret',p);
     const box=$('interp');
     if(!j.ok){box.style.display='block';box.innerHTML='<div class="status err">'+esc(j.error)+'</div>';return;}
-    let h='<table class="itable"><thead><tr><th style="width:20%">You typed</th>'
-      +'<th style="width:22%">Searched as</th><th>How it will be matched</th></tr></thead><tbody>';
+    let h='<table class="itable"><thead><tr><th style="width:22%">You typed</th>'
+      +'<th style="width:24%">Searched as</th><th>How it will be matched</th></tr></thead><tbody>';
     j.terms.forEach(t=>{
-      const al=t.aliases.map(a=>'<code>'+esc(a)+'</code>').join(' = ');
+      const al=t.aliases.map(a=>'<code>'+esc(a)+'</code>').join(' or ');
       h+='<tr><td><b>'+esc(t.input)+'</b>'+(t.scope?'<br><span class="scopetag">only '+esc(t.scope)+'</span>':'')+'</td>'
-        +'<td>'+al+(t.label?'<div class="inote" style="margin-top:4px">sheet: <b>'+esc(t.label)+'</b></div>':'')+'</td><td>'
-        +t.notes.map(n=>'<div class="inote">• '+esc(n)+'</div>').join('')
-        +t.how.map(n=>'<div class="inote">• '+esc(n)+'</div>').join('')
-        +(t.warn.length?t.warn.map(n=>'<div class="iwarn">⚠ '+esc(n)+'</div>').join('')
-                        :'<div class="iok">✓ no ambiguity detected</div>')
+        +'<td>'+al+(t.label?'<div class="inote" style="margin-top:4px">Sheet: <b>'+esc(t.label)+'</b></div>':'')+'</td><td>'
+        +t.notes.map(n=>'<div class="inote">'+esc(n)+'</div>').join('')
+        +t.how.map(n=>'<div class="inote">'+esc(n)+'</div>').join('')
+        +(t.warn.length?t.warn.map(n=>'<div class="iwarn">'+esc(n)+'</div>').join('')
+                        :'<div class="iok">No ambiguity found</div>')
         +'</td></tr>';
     });
     h+='</tbody></table>';
@@ -2814,7 +3549,7 @@ function startProgress(sid,label){
   progTimer=setInterval(async()=>{
     try{const r=await fetch('/api/progress?sid='+encodeURIComponent(sid));const j=await r.json();
       if(j.total){const pct=Math.round(100*j.done/j.total);$('progFill').style.width=pct+'%';
-        $('progTxt').textContent=(j.finished?'Finishing…':'Searching term '+(j.done+1)+' of '+j.total+(j.term?'  ·  “'+j.term+'”':''));}
+        $('progTxt').textContent=(j.finished?'Finishing…':'Searching term '+(j.done+1)+' of '+j.total+(j.term?': “'+j.term+'”':''));}
     }catch(e){}
   },500);
 }
@@ -2823,10 +3558,12 @@ function stopProgress(){if(progTimer)clearInterval(progTimer);progTimer=null;$('
 async function doSearch(){
   if(!loaded||loadedKey!==dataMode+'|'+round+'|'+JSON.stringify(paths())){await loadData();if(!loaded)return;}
   const p=payload();
-  if(p.terms.length===0){alert('Enter at least one search term.');return;}
+  const ss=$('searchStatus');ss.classList.remove('err');ss.textContent='';
+  if(p.terms.length===0){ss.textContent='Enter at least one search term.';ss.classList.add('err');$('terms').focus();return;}
+  const fp=filterProblem();
+  if(fp){ss.textContent=fp.msg;ss.classList.add('err');openFilters(fp.k);return;}
   p.sid=newSid();
   spin(true);$('btnSearch').disabled=true;
-  const ss=$('searchStatus');ss.classList.remove('err');ss.textContent='';
   $('interp').style.display='none';
   startProgress(p.sid,'Starting…'+(searchMode==='fuzzy'?' Fuzzy mode is slow on the 4th round without filters.':''));
   try{
@@ -2837,11 +3574,12 @@ async function doSearch(){
     saveHist(p);
     renderResults(j);
     const tot=j.results.reduce((a,b)=>a+b.total,0);
-    let msg='Found '+tot.toLocaleString()+' hit'+(tot===1?'':'s')+' across '+j.results.length+' term'+(j.results.length===1?'':'s')+'.';
+    let msg='Found '+plural(tot,'hit')+' across '+plural(j.results.length,'term')+'.';
     if(j.rounds.length===2){
       const r4=j.results.reduce((a,b)=>a+(b.by_round['4th round']||0),0),r5=j.results.reduce((a,b)=>a+(b.by_round['5th round']||0),0);
-      msg+='  4th round: '+r4.toLocaleString()+'  ·  5th round: '+r5.toLocaleString()+'.';
+      msg+=' 4th round: '+r4.toLocaleString()+'. 5th round: '+r5.toLocaleString()+'.';
     }
+    const fs=summaryText();if(!fs.startsWith('Searching everything'))msg+=' '+fs;
     ss.textContent=msg;
   }catch(e){ss.textContent='Search failed: '+e;ss.classList.add('err');}
   finally{stopProgress();spin(false);$('btnSearch').disabled=false;}
@@ -2862,7 +3600,7 @@ function covHtml(block,bi){
       +'<div class="covtrack"><div class="covfill '+cls+'" data-w="'+cv.pct+'"></div></div></div>';
   });
   const any=labs.some(l=>block.coverage[l].mentioned>0);
-  if(any)h+='<div style="flex-basis:100%;text-align:right"><span class="covcountries" onclick="toggleChips('+bi+')">Show jurisdictions</span></div>';
+  if(any)h+='<div style="flex-basis:100%;text-align:right"><button class="linkbtn covcountries" onclick="toggleChips('+bi+')">Show jurisdictions</button></div>';
   return h+'</div>';
 }
 function chipsHtml(block){
@@ -2873,16 +3611,16 @@ function chipsHtml(block){
   });
   if(two&&block.round_compare&&block.round_compare.length){
     const pc={'Both rounds':'both','4th round only':'p4','5th round only':'p5','Neither round':'none'};
-    h+='<div><div class="covlabel" style="margin:2px 0 4px">Jurisdictions assessed in both rounds</div><table class="cmpt"><tr><th>Jurisdiction</th><th>4th</th><th>5th</th><th></th></tr>'
+    h+='<div><div class="covlabel" style="margin:2px 0 6px">Jurisdictions assessed in both rounds</div><table class="cmpt"><tr><th>Jurisdiction</th><th>4th</th><th>5th</th><th></th></tr>'
       +block.round_compare.map(c=>'<tr><td>'+esc(c.name)+'</td><td>'+c.r4+'</td><td>'+c.r5+'</td><td><span class="pat '+pc[c.pattern]+'">'+esc(c.pattern)+'</span></td></tr>').join('')
       +'</table></div>';
   }
   return h;
 }
 function secCount(sec,rnd,two){
-  if(rnd!=='all'){const n=sec.by_round[rnd]||0;return n+' hit'+(n===1?'':'s')+' in the '+rnd;}
-  let s=sec.total+' hit'+(sec.total===1?'':'s');
-  if(two)s+='  ·  4th '+(sec.by_round['4th round']||0)+'  ·  5th '+(sec.by_round['5th round']||0);
+  if(rnd!=='all'){const n=sec.by_round[rnd]||0;return plural(n,'hit')+' in the '+rnd;}
+  let s=plural(sec.total,'hit');
+  if(two)s+=', 4th '+(sec.by_round['4th round']||0)+', 5th '+(sec.by_round['5th round']||0);
   return s;
 }
 
@@ -2892,27 +3630,27 @@ function renderResults(j){
   let top='<div class="dropnote" id="dropNote"></div>';
   if(j.rounds.length===2)
     top+='<div class="roundnote"><b>Both rounds.</b> Hits are tagged '+rtag('4th round')+' or '+rtag('5th round')
-      +'. Coverage and counts are always shown per round and never added together, because the rounds cover different countries.</div>';
+      +'. Coverage and counts are shown per round and never added together, because the rounds cover different countries.</div>';
   R.innerHTML=top;
   const openN=j.results.length<=4?j.results.length:2;
   j.results.forEach((b,bi)=>{
     const two=(b.rounds||[]).length===2;
     cards[bi]={round:'all',shown:{},loaded:false};
-    const card=document.createElement('div');card.className='termcard';card.id='card'+bi;
-    card.style.animationDelay=Math.min(bi*60,600)+'ms';
+    const card=document.createElement('article');card.className='termcard';card.id='card'+bi;
     const head=document.createElement('div');head.className='termhead'+(bi<openN?'':' closed');
-    let hh='<span class="arrow">▼</span><span class="termname">'+esc(b.term)+'</span>'
-      +'<span class="hitpill'+(b.total===0?' zero':'')+'">'+b.total.toLocaleString()+' hit'+(b.total===1?'':'s')+'</span>';
-    if(two)hh+=b.rounds.map(l=>'<span class="rpill '+RCLS[l]+'">'+RSHORT[l]+' · '+(b.by_round[l]||0).toLocaleString()+'</span>').join('');
+    head.setAttribute('role','button');head.tabIndex=0;head.setAttribute('aria-expanded',bi<openN);
+    let hh='<span class="arrow" aria-hidden="true"></span><span class="termname">'+esc(b.term)+'</span>'
+      +'<span class="hitpill'+(b.total===0?' zero':'')+'">'+plural(b.total,'hit')+'</span>';
+    if(two)hh+=b.rounds.map(l=>'<span class="rpill '+RCLS[l]+'">'+RSHORT[l]+' '+(b.by_round[l]||0).toLocaleString()+'</span>').join('');
     if(b.aliases&&b.aliases.length>1)
-      hh+='<span class="aliaswrap" title="All of these are treated as the same term">'+b.aliases.slice(1).map(a=>'<span class="alias">'+esc(a)+'</span>').join('')+'</span>';
+      hh+='<span class="aliaswrap" title="All of these are treated as the same term">also '+b.aliases.slice(1).map(a=>'<span class="alias">'+esc(a)+'</span>').join('')+'</span>';
     if(b.scope)hh+='<span class="scopetag">only '+esc(b.scope)+'</span>';
     hh+=covHtml(b,bi);
     head.innerHTML=hh;
     card.appendChild(head);
     if(b.warn&&b.warn.length){
       const wb=document.createElement('div');wb.className='warnbar';
-      wb.innerHTML=b.warn.map(w=>'<div>⚠ '+esc(w)+'</div>').join('');card.appendChild(wb);}
+      wb.innerHTML=b.warn.map(w=>'<div>'+esc(w)+'</div>').join('');card.appendChild(wb);}
     if(b.forms&&b.forms.length){
       const fb=document.createElement('div');fb.className='formsbar';
       fb.innerHTML='<span class="lbl">Matched in the text as</span>'+b.forms.map(f=>'<span class="form">'+esc(f.form)+'<i>'+f.n+'</i></span>').join('');
@@ -2922,19 +3660,21 @@ function renderResults(j){
     const body=document.createElement('div');body.className='termbody';body.id='body'+bi;
     if(bi>=openN)body.style.display='none';
     let bh='';
-    if(two)bh+='<div class="cardtools"><span class="lbl">Show</span><div class="seg mini" id="rs'+bi+'">'
+    if(two)bh+='<div class="cardtools">Show <div class="seg mini" id="rs'+bi+'">'
       +'<button class="on" data-v="all" onclick="setCardRound('+bi+',\'all\')">Both rounds</button>'
       +'<button data-v="4th round" onclick="setCardRound('+bi+',\'4th round\')">4th round only</button>'
       +'<button data-v="5th round" onclick="setCardRound('+bi+',\'5th round\')">5th round only</button></div></div>';
     b.sections.forEach((s,si)=>{
       const color=SECS[s.name]||'var(--oth)';
-      bh+='<div class="tblsec"><div class="secbar"><span class="bar" style="background:'+color+'"></span>'
+      bh+='<section class="tblsec" style="--c:'+color+'"><div class="secbar"><span class="bar" style="background:'+color+'"></span>'
         +'<span class="name">'+esc(s.name)+'</span><span class="cnt" id="cnt'+bi+'_'+si+'">'+secCount(s,'all',two)+'</span></div>'
-        +'<div id="sb'+bi+'_'+si+'"></div></div>';
+        +'<div class="secrows" id="sb'+bi+'_'+si+'"></div></section>';
     });
     body.innerHTML=bh;
-    head.onclick=()=>{head.classList.toggle('closed');const closed=head.classList.contains('closed');
-      body.style.display=closed?'none':'';if(!closed)ensureLoaded(bi);};
+    const toggle=()=>{head.classList.toggle('closed');const closed=head.classList.contains('closed');
+      head.setAttribute('aria-expanded',!closed);body.style.display=closed?'none':'';if(!closed)ensureLoaded(bi);};
+    head.onclick=e=>{if(e.target.closest('button'))return;toggle();};
+    head.onkeydown=e=>{if((e.key==='Enter'||e.key===' ')&&e.target===head){e.preventDefault();toggle();}};
     card.appendChild(body);
     R.appendChild(card);
     if(bi<openN)ensureLoaded(bi);
@@ -2951,37 +3691,55 @@ function setCardRound(bi,lab){
   b.sections.forEach((s,si)=>{$('cnt'+bi+'_'+si).textContent=secCount(s,lab,true);loadSection(bi,si,false,PAGE);});
 }
 function tableShell(two,isMer){
-  if(isMer)return '<table class="results"><colgroup>'+(two?'<col style="width:6%">':'')
-      +'<col style="width:11%"><col style="width:8%"><col style="width:17%"><col style="width:9%"><col><col style="width:62px"></colgroup>'
-      +'<thead><tr>'+(two?'<th>Round</th>':'')+'<th>Jurisdiction</th><th>Measure</th><th>Indicator</th><th>Rating</th><th>Detected term and context</th><th></th></tr></thead><tbody></tbody></table>';
-  return '<table class="results"><colgroup><col style="width:24%"><col style="width:35%"><col><col style="width:62px"></colgroup>'
-      +'<thead><tr><th>Where in the file</th><th>Sentence with term</th><th>Detected term and context</th><th></th></tr></thead><tbody></tbody></table>';
+  if(isMer)return '<table class="results"><colgroup>'+(two?'<col style="width:56px">':'')
+      +'<col style="width:13%"><col style="width:84px"><col style="width:17%"><col style="width:76px"><col><col style="width:68px"></colgroup>'
+      +'<thead><tr>'+(two?'<th>Round</th>':'')+'<th>Jurisdiction</th><th>Measure</th><th>Indicator</th><th>Rating</th><th>Term in context</th><th><span class="sr">Actions</span></th></tr></thead><tbody></tbody></table>';
+  return '<table class="results"><colgroup><col style="width:24%"><col style="width:32%"><col><col style="width:68px"></colgroup>'
+      +'<thead><tr><th>Where in the file</th><th>Sentence with the term</th><th>Term in context</th><th><span class="sr">Actions</span></th></tr></thead><tbody></tbody></table>';
 }
 function actions(id){
   const d=excluded.has(id);
-  return '<td class="acts"><button class="actbtn" title="Copy the quote with its citation" onclick="copyCite(\''+id+'\',this)">⧉</button>'
-    +'<button class="exbtn" title="'+(d?'Put this hit back':'Remove this hit from the export')+'" onclick="toggleDrop(\''+id+'\',this)">'+(d?'↺':'✕')+'</button></td>';
+  return '<td class="acts"><button class="actbtn" title="Copy the quote with its citation" aria-label="Copy quote" onclick="copyCite(\''+id+'\',this)">⧉</button>'
+    +'<button class="exbtn" title="'+(d?'Put this hit back':'Remove this hit from the export')+'" aria-label="'+(d?'Put back':'Remove')+'" onclick="toggleDrop(\''+id+'\',this)">'+(d?'↺':'✕')+'</button></td>';
+}
+function readTools(x){
+  return '<div class="rowtools"><button class="readbtn" aria-expanded="false" onclick="toggleDoc(this,\''+x._id+'\')">Read paragraph</button>'
+    +fmtTags(x.html)+'</div>';
 }
 function rowHtml(x,two,isMer){
-  const cls=excluded.has(x._id)?' class="dropped"':'';
+  const cls=excluded.has(x._id)?' dropped':'';
   if(isMer){
     const crit=(x['Criteria rating']&&x['Criteria rating']!=='NA')?'<br>'+pill(x['Criteria rating']):'';
-    return '<tr'+cls+' data-id="'+x._id+'">'+(two?'<td>'+rtag(x.Round)+'</td>':'')
-      +'<td class="jur">'+esc(x.Jurisdiction)+'</td><td>'+esc(x.MEASURE)+'</td><td>'+esc(x.Indicator)+'</td>'
+    return '<tr class="hit'+cls+'" data-id="'+x._id+'">'+(two?'<td>'+rtag(x.Round)+'</td>':'')
+      +'<td class="jur">'+esc(x.Jurisdiction)+'</td><td class="meas">'+esc(x.MEASURE)+'</td><td>'+esc(x.Indicator)+'</td>'
       +'<td>'+(x.Rating==='NA'?'<span class="pill na">NA</span>':pill(x.Rating))+crit+'</td>'
-      +'<td>'+hl(x.context,x.matched,x.variants)
-      +' <span class="showfull" onclick="toggleFull(this)">show full text</span>'
-      +'<div class="full">'+hl(x.OBS_VALUE,x.matched,x.variants)+'</div></td>'+actions(x._id)+'</tr>';
+      +'<td class="ctx">'+hl(x.context,x.matched,x.variants)+readTools(x)+'</td>'+actions(x._id)+'</tr>';
   }
-  return '<tr'+cls+' data-id="'+x._id+'"><td class="jur">'+esc(x.Location)
-    +(x.Details?'<div style="font-weight:400;color:var(--muted);margin-top:3px;font-size:11.5px">'+esc(String(x.Details).slice(0,220))+'</div>':'')
-    +'</td><td>'+hl(x['Sentence with term'],x.matched,x.variants)+'</td>'
-    +'<td>'+hl(x.context,x.matched,x.variants)
-    +' <span class="showfull" onclick="toggleFull(this)">show full text</span>'
-    +'<div class="full">'+hl(x['Full text'],x.matched,x.variants)+'</div></td>'+actions(x._id)+'</tr>';
+  return '<tr class="hit'+cls+'" data-id="'+x._id+'"><td class="jur">'+esc(x.Location)
+    +(x.Details?'<div style="font-weight:400;color:var(--muted);margin-top:3px;font-size:12px">'+esc(String(x.Details).slice(0,220))+'</div>':'')
+    +'</td><td class="ctx">'+hl(x['Sentence with term'],x.matched,x.variants)+'</td>'
+    +'<td class="ctx">'+hl(x.context,x.matched,x.variants)+readTools(x)+'</td>'+actions(x._id)+'</tr>';
 }
-function toggleFull(el){const d=el.nextElementSibling;const open=d.style.display==='block';
-  d.style.display=open?'none':'block';el.textContent=open?'show full text':'hide full text';}
+function docNode(x,color){
+  const art=document.createElement('div');art.className='doc';art.style.setProperty('--c',color);
+  const head=document.createElement('div');head.className='dochead';
+  head.innerHTML='<span class="cite">'+esc(x.ref||'')+'</span>'+(x.Indicator?'<span>'+esc(x.Indicator)+'</span>':'')
+    +'<span class="sp"></span><button class="linkbtn" onclick="copyCite(\''+x._id+'\',this)">Copy quote</button>';
+  const body=document.createElement('div');body.className='docbody';
+  if(x.html){body.innerHTML=x.html;shapeDoc(body);markDom(body,x.matched,x.variants);}
+  else{body.innerHTML='<p>'+hl(x.OBS_VALUE||x['Full text']||'',x.matched,x.variants)+'</p>';}
+  art.appendChild(head);art.appendChild(body);return art;
+}
+function toggleDoc(btn,id){
+  const tr=btn.closest('tr');const nx=tr.nextElementSibling;
+  if(nx&&nx.classList.contains('docrow')&&nx.dataset.for===id){nx.remove();btn.setAttribute('aria-expanded','false');btn.textContent='Read paragraph';return;}
+  const x=rowCache[id];if(!x)return;
+  const row=document.createElement('tr');row.className='docrow';row.dataset.for=id;
+  const td=document.createElement('td');td.colSpan=tr.children.length;
+  const sec=tr.closest('.tblsec');const color=sec?getComputedStyle(sec).getPropertyValue('--c')||'var(--accent)':'var(--accent)';
+  td.appendChild(docNode(x,color));row.appendChild(td);tr.after(row);
+  btn.setAttribute('aria-expanded','true');btn.textContent='Close paragraph';
+}
 
 async function loadSection(bi,si,append,limit){
   const st=cards[bi];const b=lastResults[bi];const sec=b.sections[si];
@@ -3007,14 +3765,14 @@ async function loadSection(bi,si,append,limit){
   const left=j.total-st.shown[si];
   if(left>0){
     box.insertAdjacentHTML('beforeend','<div class="morebar"><button class="morebtn" onclick="loadSection('+bi+','+si+',true,'+PAGE+')">Show '
-      +Math.min(PAGE,left)+' more  ·  '+st.shown[si]+' of '+j.total+' shown</button>'
+      +Math.min(PAGE,left)+' more ('+st.shown[si]+' of '+j.total+' shown)</button>'
       +'<button class="morebtn all" onclick="loadSection('+bi+','+si+',true,500)">Show '+(left>500?'500 more':'all')+'</button></div>');
   }
 }
 
 function updateDropNote(){const note=$('dropNote');if(!note)return;
   note.style.display=excluded.size?'block':'none';
-  note.textContent=excluded.size+' hit'+(excluded.size===1?'':'s')+' removed. They will be left out of the export and out of its statistics.';}
+  note.textContent=plural(excluded.size,'hit')+' removed. They will be left out of the export and its statistics.';}
 function toggleDrop(id,el){
   if(excluded.has(id))excluded.delete(id);else excluded.add(id);
   const d=excluded.has(id);
@@ -3032,7 +3790,8 @@ async function copyCite(id,btn){
   try{await navigator.clipboard.writeText(t);ok=true;}catch(e){
     const ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();
     try{ok=document.execCommand('copy');}catch(e2){}ta.remove();}
-  if(ok){btn.textContent='✓';btn.classList.add('done');setTimeout(()=>{btn.textContent='⧉';btn.classList.remove('done');},1300);}
+  if(ok){const old=btn.textContent;btn.textContent=btn.classList.contains('linkbtn')?'Copied':'✓';btn.classList.add('done');
+    setTimeout(()=>{btn.textContent=old;btn.classList.remove('done');},1300);}
   else alert(t);
 }
 function toggleChips(i){const cb=$('chips'+i);cb.classList.toggle('open');
@@ -3055,11 +3814,11 @@ async function doExport(fmt){
   if(fmt!=='docx'&&n>15000)
     warn.push('The Excel file will be about '+Math.round(n*(sent?0.36:1.45)/1000)+' MB and may take a minute or two to build.');
   if(warn.length&&!confirm(warn.join('\n\n')
-      +(sent?'':'\n\nTip: choosing "Quotes: sentence only" makes both files several times smaller.')+'\n\nBuild anyway?'))return;
+      +(sent?'':'\n\nTip: "Quotes: sentence only" makes both files several times smaller.')+'\n\nBuild anyway?'))return;
   spin(true);
   const ss=$('searchStatus');ss.classList.remove('err');
   ss.textContent='Building the '+(fmt==='docx'?'Word report':fmt==='both'?'files':'spreadsheet')+
-    (excluded.size?' (leaving out '+excluded.size+' removed hit'+(excluded.size===1?'':'s')+')':'')+'…';
+    (excluded.size?' (leaving out '+plural(excluded.size,'removed hit')+')':'')+'…';
   try{
     const j=await post('/api/export',lastPayload);
     if(j.ok){ss.innerHTML='Saved:<br>'+j.paths.map(esc).join('<br>')+'<br><button class="linkbtn" onclick="openFolder()">Open export folder</button>';}
@@ -3071,7 +3830,7 @@ async function openFolder(){try{const j=await post('/api/open_folder',{folder:$(
   if(!j.ok)alert('Could not open the folder: '+j.error);}catch(e){alert('Could not open the folder: '+e);}}
 
 function clearAll(){$('terms').value='';
-  $('results').innerHTML='<div class="welcome"><div class="biglyph">MER</div>Load a data source on the left, enter your terms, and search.<br>Every term gets its own results card with jurisdiction coverage for each round.</div>';
+  $('results').innerHTML=WELCOME;
   $('searchStatus').textContent='';$('interp').style.display='none';$('interp').innerHTML='';
   ['btnExportX','btnExportW','btnExportB'].forEach(id=>$(id).disabled=true);
   lastPayload=null;excluded.clear();clearFilters();countTerms();fileNamePreview();}
@@ -3082,13 +3841,11 @@ function saveHist(p){
   let h=histGet();
   h.unshift({t:p.terms,mode:p.data_mode,round:p.round,sm:p.search_mode,when:new Date().toLocaleString()});
   histSet(h.slice(0,25));renderHist();}
-function histLabel(x){
-  const src=(x.mode==='OTHER')?'Other files':(x.round==='both'?'4th + 5th':(x.round==='4'?'4th round':(x.round==='5'?'5th round':'')));
-  return (src?'['+src+'] ':'')+x.t.join(', ');}
+function histSrc(x){return (x.mode==='OTHER')?'Other files':(x.round==='both'?'Both rounds':(x.round==='4'?'4th round':(x.round==='5'?'5th round':'')));}
 function renderHist(){
   const h=histGet();const el=$('hist');
   if(!h.length){el.innerHTML='<div class="empty">No searches yet.</div>';return;}
-  el.innerHTML=h.map((x,i)=>'<a onclick="reuse('+i+')" title="'+esc(x.when)+'">'+esc(histLabel(x))+'</a>').join('');}
+  el.innerHTML=h.map((x,i)=>'<a onclick="reuse('+i+')" title="'+esc(x.when)+'"><small>'+esc(histSrc(x))+'</small>'+esc(x.t.join(', '))+'</a>').join('');}
 async function reuse(i){const x=histGet()[i];if(!x)return;
   $('terms').value=x.t.join('\n');countTerms();fileNamePreview();
   if(x.sm)setSM(x.sm);
@@ -3100,11 +3857,18 @@ async function reuse(i){const x=histGet()[i];if(!x)return;
   window.scrollTo({top:0});}
 function countTerms(){
   const n=$('terms').value.split('\n').map(t=>t.trim()).filter(Boolean).length;
-  $('termCount').innerHTML=n+' term'+(n===1?'':'s')+' ready &nbsp;·&nbsp; no limit';}
+  $('termCount').textContent=n?plural(n,'term'):'No terms yet';}
 
 $('terms').addEventListener('input',()=>{countTerms();fileNamePreview();});
 $('terms').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();doSearch();}});
 $('reportName').addEventListener('input',fileNamePreview);
+$('dlgSearch').addEventListener('input',()=>{const f=F[curTab];f.q=$('dlgSearch').value;
+  const rs=document.querySelector('.fsearch[data-f="'+curTab+'"]');if(rs)rs.value=f.q;refreshFacet(curTab);});
+$('dlgOnly').addEventListener('change',()=>refreshFacet(curTab));
+$('fdlg').addEventListener('click',e=>{if(e.target===$('fdlg'))closeFilters();});   // click on the backdrop
+$('results').innerHTML=WELCOME;
+restorePaths();
+buildRail();refreshAll();
 countTerms();fileNamePreview();roundHint();renderHist();
 loadData();          // load the default round straight away
 </script>
@@ -3129,7 +3893,7 @@ if __name__ == "__main__":
     os.makedirs(DEFAULT_EXPORT_DIR, exist_ok=True)
     threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
     print(f"\n  MER Search Tool {VERSION} running at http://127.0.0.1:{PORT}")
-    print("  New: search the 4th and 5th rounds together | Round column in every export")
+    print("  New: paragraphs shown with their tables and boxes | new filter panel")
     print(f"  Data folder: {BASE_DIR}")
     print("  Keep this window open while using the tool. Press Ctrl+C to stop.\n")
     app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
