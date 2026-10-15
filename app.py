@@ -28,7 +28,7 @@ import traceback
 from collections import Counter, defaultdict, OrderedDict
 from copy import copy
 from datetime import datetime
-from html import escape as html_escape
+from html import escape as html_escape, unescape as html_unescape
 from html.parser import HTMLParser
 
 import pandas as pd
@@ -64,6 +64,7 @@ BASE_DIR = _HERE if os.path.isdir(os.path.join(_HERE, "source files")) else FALL
 MER_DIR     = os.path.join(BASE_DIR, "source files", "MER")
 ROUND4_DIR  = os.path.join(MER_DIR, "round_4")
 ROUND5_DIR  = os.path.join(MER_DIR, "round_5")
+KID_DIR     = os.path.join(BASE_DIR, "source files", "KID")
 OTHER_DIR   = os.path.join(BASE_DIR, "source files", "other")
 DEFAULT_EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 
@@ -75,6 +76,11 @@ PORT          = 5177
 
 ROUND_LABEL = {"4": "4th round", "5": "5th round"}
 TABLES = ["Effectiveness", "Risk and Context", "Technical Compliance"]
+KID_TABLES = ["Effectiveness", "Technical Compliance", "General"]
+STRUCTURED = ("MER", "KID")          # sources with rounds, jurisdictions and ratings
+
+def tables_for(mode):
+    return KID_TABLES if mode == "KID" else TABLES
 
 def rounds_of(sel):
     """'4' -> ['4'], '5' -> ['5'], 'both' -> ['4', '5']"""
@@ -86,24 +92,28 @@ def rounds_of(sel):
 def round_labels(sel):
     return [ROUND_LABEL[r] for r in rounds_of(sel)]
 
-def source_label(sel):
+def source_label(sel, mode="MER"):
     rs = rounds_of(sel)
+    if mode == "KID":
+        return "Key Issue Documents, " + (
+            "4th and 5th round" if len(rs) == 2 else ROUND_LABEL[rs[0]])
     if len(rs) == 2:
         return "MER 4th and 5th round"
     return "MER " + ROUND_LABEL[rs[0]]
 
 # folders can be overridden from the interface
-PATHS = {"round_4": ROUND4_DIR, "round_5": ROUND5_DIR, "other": OTHER_DIR}
+PATHS = {"round_4": ROUND4_DIR, "round_5": ROUND5_DIR, "kid": KID_DIR, "other": OTHER_DIR}
 
 def set_paths(p):
     """Accept folder overrides typed by the user; blank means the default."""
-    defaults = {"round_4": ROUND4_DIR, "round_5": ROUND5_DIR, "other": OTHER_DIR}
-    for k in ("round_4", "round_5", "other"):
+    defaults = {"round_4": ROUND4_DIR, "round_5": ROUND5_DIR, "kid": KID_DIR, "other": OTHER_DIR}
+    for k in ("round_4", "round_5", "kid", "other"):
         v = (p or {}).get(k)
         newv = str(v).strip().strip('"').strip("'") if v and str(v).strip() else defaults[k]
         if newv != PATHS[k]:
             PATHS[k] = newv
-            _CACHE.pop({"round_4": "mer4", "round_5": "mer5", "other": "other"}[k], None)
+            _CACHE.pop({"round_4": "mer4", "round_5": "mer5", "kid": "kid",
+                        "other": "other"}[k], None)
             _CACHE.pop("merboth", None)
 
 app = Flask(__name__)
@@ -425,6 +435,127 @@ def load_mer(sel):
     df = pd.concat(parts, ignore_index=True)
     _CACHE["merboth"] = (ids, df)
     return df
+
+# =============================================================================
+# KEY ISSUE DOCUMENTS
+# =============================================================================
+# One CSV from OECD Data Explorer (DF_KID). Each KID has five parts, one row
+# each. The search runs on each part; a hit is the KID, and the browser and
+# the exports show the whole KID with the parts that matched marked.
+KID_PARTS = OrderedDict([("ISSUE", "Key issue"),
+                         ("ECG_CONCL", "ECG discussion"),
+                         ("ECG_PROP", "ECG proposal to Plenary"),
+                         ("PLEN_RECORD", "Plenary discussion"),
+                         ("DISCUSSION_OUTCOME", "Plenary decision")])
+KID_PART_NAMES = list(KID_PARTS.values())
+_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
+           "September", "October", "November", "December"]
+KID_COLS = ["KID", "KIDNo", "ThemeCode", "Theme", "Part", "PartNo", "Outcome", "Plenary"]
+
+def plenary_label(tp):
+    """'2015-02' -> 'February 2015'"""
+    m = re.match(r"^(\d{4})-(\d{2})", str(tp or ""))
+    if not m or not 1 <= int(m.group(2)) <= 12:
+        return str(tp or "")
+    return f"{_MONTHS[int(m.group(2)) - 1]} {m.group(1)}"
+
+def kid_short(kid):
+    """'KID n°47 (4th round)' -> 'KID n°47'"""
+    return re.sub(r"\s*\([^)]*\)\s*$", "", str(kid or "")).strip()
+
+def html_to_lines(text):
+    """Plain text that keeps the paragraph breaks (for Word and Excel)."""
+    if pd.isna(text):
+        return ""
+    t = str(text)
+    t = re.sub(r"(?i)<\s*br\s*/?>|<\s*/\s*(p|div|li|tr|h\d)\s*>", "\n", t)
+    t = re.sub(r"(?i)<\s*li[^>]*>", "\n\u2022 ", t)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = html_unescape(t).replace("\xa0", " ")
+    t = ILLEGAL_XLSX.sub("", t)
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in t.split("\n")]
+    return "\n".join(ln for ln in lines if ln)
+
+def kid_html(text):
+    """Display HTML for one KID part. Line breaks in the source are real
+       breaks (bullet lists are often typed as lines)."""
+    if pd.isna(text) or not str(text).strip():
+        return ""
+    t = str(text).strip()
+    if not re.search(r"<\s*/?\s*[a-zA-Z]", t):
+        return "".join(f"<p>{html_escape(ln.strip(), quote=False)}</p>"
+                       for ln in t.split("\n") if ln.strip())
+    return sanitize_html(re.sub(r"\s*\n\s*", "<br>", t))
+
+def _build_kid(path):
+    d = pd.read_csv(path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+    need = ["MER_ROUND", "Jurisdiction", "IOS_REC", "IOs / Recommendations", "THEME",
+            "Key Issue theme", "KID_ELEMENT", "Plenary decision", "KID_FINAL_EFF_RATING",
+            "Final effectiveness rating", "KID_FINAL_COMP_RATING",
+            "Final technical compliance rating", "KID_ID", "TIME_PERIOD", "OBS_VALUE"]
+    missing = [c for c in need if c not in d.columns]
+    if missing:
+        raise ValueError("The Key Issue Documents CSV is missing the column(s) "
+                         + ", ".join(missing) + ". Download the full DF_KID table from "
+                         "OECD Data Explorer, with labels.")
+    register_labels(d["KID_FINAL_EFF_RATING"], d["Final effectiveness rating"])
+    register_labels(d["KID_FINAL_COMP_RATING"], d["Final technical compliance rating"])
+    rows = []
+    for _, x in d.iterrows():
+        m = x["IOS_REC"].strip()
+        table = ("Effectiveness" if m.startswith("IO") else
+                 "Technical Compliance" if re.match(r"^R\d", m) else "General")
+        eff = combine_rating(x["KID_FINAL_EFF_RATING"], x["Final effectiveness rating"])
+        comp = combine_rating(x["KID_FINAL_COMP_RATING"], x["Final technical compliance rating"])
+        rating = eff if table == "Effectiveness" else comp if table == "Technical Compliance" \
+            else (eff if eff != "NA" else comp)
+        ind = x["IOs / Recommendations"].strip()
+        part = KID_PARTS.get(x["KID_ELEMENT"], x["KID_ELEMENT"])
+        kid = x["KID_ID"].strip()
+        no = re.search(r"(\d+)", kid)
+        raw = x["OBS_VALUE"]
+        rows.append({
+            "Round": ROUND_LABEL.get(x["MER_ROUND"].strip(), x["MER round"] if "MER round" in d.columns else x["MER_ROUND"]),
+            "Jurisdiction": x["Jurisdiction"].strip(),
+            "Table": table,
+            "MEASURE": "" if m in ("", "_Z") else m,
+            "Indicator": "No IO or Recommendation" if ind in ("", "Not applicable") else ind,
+            "Rating": rating, "Criteria rating": "NA",
+            "OBS_VALUE": strip_html(raw), "OBS_HTML": kid_html(raw), "Lines": html_to_lines(raw),
+            "KID": kid, "KIDNo": int(no.group(1)) if no else 0,
+            "ThemeCode": x["THEME"].strip(), "Theme": x["Key Issue theme"].strip(),
+            "Part": part, "PartNo": KID_PART_NAMES.index(part) if part in KID_PART_NAMES else 9,
+            "Outcome": x["Plenary decision"].strip() or "Not recorded",
+            "Plenary": x["TIME_PERIOD"].strip(),
+        })
+    df = pd.DataFrame(rows)
+    df["_norm"] = [norm_text(t) for t in df["OBS_VALUE"].tolist()]
+    index = defaultdict(list)
+    for rec in df.drop(columns=["_norm"]).to_dict("records"):
+        index[rec["KID"]].append(rec)
+    for v in index.values():
+        v.sort(key=lambda r: r["PartNo"])
+    return df, dict(index)
+
+def kid_file():
+    return _find_csv(PATHS["kid"], ["kid"], "Key Issue Documents")
+
+def load_kid_all():
+    path = kid_file()
+    sig = _file_sig(path)
+    ent = _CACHE.get("kid")
+    if ent is None or ent[0] != sig:
+        df, index = _build_kid(path)
+        ent = _CACHE["kid"] = (sig, df, index)
+    return ent[1], ent[2]
+
+def load_kid(sel):
+    df, _ = load_kid_all()
+    return df[df["Round"].isin(round_labels(sel))]
+
+def load_struct(p):
+    """The table behind a structured source (MER or KID) for this search."""
+    return load_kid(p["round"]) if p.get("data_mode") == "KID" else load_mer(p["round"])
 
 MAX_RECORDS_PER_FILE = 40000
 
@@ -970,6 +1101,10 @@ def apply_filters(df, filters):
         sub = sub[sub["Rating"].isin(f["ratings"])]
     if f.get("crit_ratings"):
         sub = sub[sub["Criteria rating"].isin(f["crit_ratings"])]
+    for key, col in (("themes", "ThemeCode"), ("parts", "Part"), ("outcomes", "Outcome"),
+                     ("plenaries", "Plenary")):
+        if f.get(key) and col in sub.columns:
+            sub = sub[sub[col].isin(f[key])]
     return sub
 
 
@@ -995,10 +1130,20 @@ def _measure_key(m):
     """Natural sort: IO2 before IO10, R3 before R22."""
     return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', str(m))]
 
-_TABLE_ORDER = {t: i for i, t in enumerate(TABLES)}
+_TABLE_ORDER = {t: i for i, t in enumerate(TABLES + ["General"])}
 
 def citation(r):
     """'Austria, 5th round MER, IO.4 (rated ME)'"""
+    if r.get("KID"):
+        ref = f'{r["Jurisdiction"]}, {kid_short(r["KID"])} ({r["Round"]})'
+        if r.get("MEASURE"):
+            ref += f', {pretty_measure(r["MEASURE"])}'
+        ref += f', {plenary_label(r.get("Plenary"))} Plenary'
+        if r.get("Outcome"):
+            ref += f': {r["Outcome"].lower()}'
+        if r.get("Rating") and r["Rating"] != "NA":
+            ref += f', final rating {r["Rating"]}'
+        return ref
     ref = f'{r["Jurisdiction"]}, {r["Round"]} MER, {pretty_measure(r["MEASURE"])}'
     if r.get("Rating") and r["Rating"] != "NA":
         ref += f' (rated {r["Rating"]})'
@@ -1050,7 +1195,61 @@ def search_mer(df, tp, mode, threshold, filters):
                                 r["Round"], _measure_key(r["MEASURE"])))
     return results
 
-def coverage_stats(df, filters, results):
+def search_kid(df, tp, mode, threshold, filters):
+    """Search each part of each KID; one result per KID that matches, carrying
+       all five parts (the filter on parts limits only where to search)."""
+    sub = apply_filters(df, filters)
+    if sub.empty or (tp["pattern"] is None and not any(tp["tokens"])):
+        return []
+    _, index = load_kid_all()
+    texts, kids, pnos = sub["OBS_VALUE"].tolist(), sub["KID"].tolist(), sub["PartNo"].tolist()
+    if mode in ("strict", "exact"):
+        norms = sub["_norm"].tolist()
+        groups = [g for g in tp["ptokens"] if g]
+        idx = [i for i, n in enumerate(norms) if any(all(t in n for t in g) for g in groups)]
+    else:
+        idx = range(len(texts))
+    found = defaultdict(dict)
+    for i in idx:
+        if not texts[i]:
+            continue
+        hit = find_match(texts[i], tp, mode, threshold)
+        if hit is not None:
+            found[kids[i]][pnos[i]] = (hit, texts[i])
+    results = []
+    for kid, parts in found.items():
+        recs = index[kid]
+        base = recs[0]
+        r = {c: base[c] for c in UNIFORM_COLS if c != "OBS_VALUE"}
+        r.update({c: base[c] for c in KID_COLS if c not in ("Part", "PartNo")})
+        order = sorted(parts)
+        variants = []
+        for pn in order:
+            for v in parts[pn][0][2]:
+                if v not in variants:
+                    variants.append(v)
+        (s0, e0, _), t0 = parts[order[0]]
+        names = [KID_PART_NAMES[pn] for pn in order]
+        r["matched_parts"] = names
+        r["context"] = f"[{names[0]}] " + make_context(t0, s0, e0)
+        r["sentence"] = "  \u2026  ".join(
+            f"[{KID_PART_NAMES[pn]}] " + sentence_of(parts[pn][1], *parts[pn][0][:2])
+            for pn in order)
+        r["OBS_VALUE"] = "\n\n".join(f"{KID_PART_NAMES[pn]}: {parts[pn][1]}" for pn in order)
+        r["parts"] = [{"part": x["Part"], "html": x["OBS_HTML"], "lines": x["Lines"],
+                       "hit": x["PartNo"] in parts} for x in recs]
+        r["html"] = ""
+        r["matched"] = variants[0]
+        r["variants"] = variants
+        r["PlenaryLabel"] = plenary_label(r["Plenary"])
+        r["ref"] = citation(r)
+        r["_id"] = row_id(r)
+        results.append(r)
+    results.sort(key=lambda r: (_TABLE_ORDER.get(r["Table"], 9), r["Jurisdiction"],
+                                r["Round"], r["Plenary"], r["KIDNo"]))
+    return results
+
+def coverage_stats(df, filters, results, tables=TABLES):
     """% of jurisdictions (within the current filter scope) that mention the term.
        Always called for ONE round at a time."""
     scope = apply_filters(df, filters)
@@ -1059,7 +1258,7 @@ def coverage_stats(df, filters, results):
     mentioned = len(counts)
     pct = round(100.0 * mentioned / total, 1) if total else 0.0
     per_table = {tbl: len({r["Jurisdiction"] for r in results if r["Table"] == tbl})
-                 for tbl in TABLES}
+                 for tbl in tables}
     return {"mentioned": mentioned, "total": total, "pct": pct,
             "per_table": per_table,
             "jurisdictions": [{"name": k, "hits": v} for k, v in counts.most_common()]}
@@ -1159,8 +1358,9 @@ def run_search(p, sid=None):
     threshold = float(p.get("threshold", 85))
     csa = bool(p.get("caps_only", False))
     raw = []
-    if p["data_mode"] == "MER":
-        df = load_mer(p["round"])
+    if p["data_mode"] in STRUCTURED:
+        df = load_struct(p)
+        searcher = search_kid if p["data_mode"] == "KID" else search_mer
         known = sorted(df["Jurisdiction"].unique().tolist())
         for i, group in enumerate(terms):
             _set_progress(sid, i, len(terms), group)
@@ -1170,7 +1370,7 @@ def run_search(p, sid=None):
             filters = dict(p.get("filters", {}) or {})
             if tp["scope"]:                      # "SAMLIT (South Africa)"
                 filters["jurisdictions"] = [tp["scope"]]
-            res = search_mer(df, tp, mode, threshold, filters)
+            res = searcher(df, tp, mode, threshold, filters)
             raw.append({"term": tp["label"], "aliases": tp["aliases"],
                         "scope": tp["scope"], "notes": tp["notes"],
                         "how": tp["how"], "warn": tp["warn"], "input": tp["input"],
@@ -1210,8 +1410,9 @@ def finalize(p, raw, excluded=None):
     """Apply removed hits, then compute statistics - always per round."""
     excluded = set(excluded or [])
     blocks = []
-    if p["data_mode"] == "MER":
-        df = load_mer(p["round"])
+    if p["data_mode"] in STRUCTURED:
+        df = load_struct(p)
+        tables = tables_for(p["data_mode"])
         labels = round_labels(p["round"])
         per_round = {lab: df[df["Round"] == lab] for lab in labels}
         for b in raw:
@@ -1220,14 +1421,15 @@ def finalize(p, raw, excluded=None):
             nb["results"] = res
             nb["rounds"] = labels
             nb["coverage"] = {lab: coverage_stats(per_round[lab], b["filters"],
-                                                  [r for r in res if r["Round"] == lab])
+                                                  [r for r in res if r["Round"] == lab], tables)
                               for lab in labels}
             if len(labels) == 2:
                 nb["round_compare"] = round_compare(
                     apply_filters(per_round["4th round"], b["filters"]),
                     apply_filters(per_round["5th round"], b["filters"]), res)
             nb["forms"] = _form_counts(res)
-            nb["source_label"] = source_label(p["round"])
+            nb["source_label"] = source_label(p["round"], p["data_mode"])
+            nb["tables"] = tables
             blocks.append(nb)
     else:
         for b in raw:
@@ -1249,7 +1451,8 @@ def _slim_row(r):
     keep = ("_id", "Round", "Jurisdiction", "Table", "MEASURE", "Indicator", "Rating",
             "Criteria rating", "OBS_VALUE", "html", "context", "sentence", "matched",
             "variants", "ref", "File", "Location", "Sentence with term", "Details",
-            "Full text")
+            "Full text", "KID", "Theme", "Outcome", "Plenary", "PlenaryLabel", "parts",
+            "matched_parts")
     return {k: r[k] for k in keep if k in r}
 
 
@@ -1420,13 +1623,15 @@ def _stat_line(b, lab):
     rows = [x for x in b["results"] if x["Round"] == lab]
     cov = b["coverage"][lab]
     nby = Counter(x["Table"] for x in rows)
-    meas = Counter(pretty_measure(x["MEASURE"]) for x in rows)
+    meas = Counter(pretty_measure(x["MEASURE"]) for x in rows if x["MEASURE"])
     rat = Counter(x["Rating"] for x in rows if x.get("Rating") and x["Rating"] != "NA")
-    s = (f"{lab.upper()}:  {len(rows)} mention{'s' if len(rows) != 1 else ''} in "
+    unit = "KID" if rows and rows[0].get("KID") else "mention"
+    s = (f"{lab.upper()}:  {len(rows)} {unit}{'s' if len(rows) != 1 else ''} in "
          f"{cov['mentioned']} of {cov['total']} jurisdictions ({cov['pct']}%)   |   "
-         f"Effectiveness {nby.get('Effectiveness', 0)}, Risk and context "
-         f"{nby.get('Risk and Context', 0)}, Technical compliance "
-         f"{nby.get('Technical Compliance', 0)}")
+         + ", ".join(f"{t} {nby.get(t, 0)}" for t in b.get("tables", TABLES)))
+    if unit == "KID":
+        dec = Counter(x["Outcome"] for x in rows)
+        s += "   |   Plenary decisions: " + ", ".join(f"{k} ({v})" for k, v in dec.most_common())
     if meas:
         s += "   |   Most under: " + ", ".join(f"{k} ({v})" for k, v in meas.most_common(5))
     if rat:
@@ -1434,7 +1639,9 @@ def _stat_line(b, lab):
     return s
 
 def _write_summary(ws, p, blocks, sheet_names):
-    is_mer = p["data_mode"] == "MER"
+    is_mer = p["data_mode"] in STRUCTURED
+    is_kid = p["data_mode"] == "KID"
+    tbls = tables_for(p["data_mode"])
     labels = blocks[0]["rounds"] if (blocks and is_mer) else []
     ncols = 14 if is_mer else 5
     _band(ws, 1, "FATF Search Tool  -  Summary", ncols)
@@ -1450,14 +1657,16 @@ def _write_summary(ws, p, blocks, sheet_names):
                      "Round column to see one round.", ncols, fill=WARN_FILL,
               color="7A5A12", bold=True)
         r += 1
-    _note(ws, r, "Click a search term to jump to its sheet. 'Country matrix' shows which "
-                 "jurisdictions mention which terms; 'All hits' lists every hit in one "
-                 "filterable table.", ncols, italic=True)
+    _note(ws, r, ("Each hit is one Key Issue Document (KID) in which the term appears in "
+                  "at least one of its five parts. " if is_kid else "")
+              + "Click a search term to jump to its sheet. 'Country matrix' shows which "
+                "jurisdictions mention which terms; 'All hits' lists every hit in one "
+                "filterable table.", ncols, italic=True)
     r += 2
     hr = r
     if is_mer:
-        headers = ["Search term", "Round", "Total hits", "Effectiveness",
-                   "Risk and Context", "Technical Compliance", "Jurisdictions mentioned",
+        headers = ["Search term", "Round", "KIDs mentioning it" if is_kid else "Total hits"] + tbls + [
+                   "Jurisdictions mentioned",
                    "Jurisdictions in scope", "Coverage %", "Jurisdictions list",
                    "Equivalent terms searched", "Restricted to",
                    "Matched in text as (count)", "How it was searched / warnings"]
@@ -1472,9 +1681,8 @@ def _write_summary(ws, p, blocks, sheet_names):
                 cov = b["coverage"][lab]
                 nby = Counter(x["Table"] for x in rows)
                 forms = _form_counts(rows)
-                vals = [b["term"], lab, len(rows),
-                        nby.get("Effectiveness", 0), nby.get("Risk and Context", 0),
-                        nby.get("Technical Compliance", 0), cov["mentioned"],
+                vals = [b["term"], lab, len(rows)] + [nby.get(t, 0) for t in tbls] + [
+                        cov["mentioned"],
                         cov["total"], (cov["pct"] / 100.0),
                         ", ".join(f"{j['name']} ({j['hits']})" for j in cov["jurisdictions"]),
                         " ~ ".join(b.get("aliases") or [b["term"]]), b.get("scope") or "",
@@ -1520,14 +1728,17 @@ def _write_summary(ws, p, blocks, sheet_names):
 def _write_matrix(ws, p, blocks):
     """Jurisdiction x term: how many paragraphs mention each term."""
     labels = blocks[0]["rounds"] if blocks else []
-    df = load_mer(p["round"])
+    df = load_struct(p)
+    unit = "KIDs" if p["data_mode"] == "KID" else "paragraphs"
     base_filters = dict(p.get("filters", {}) or {})
     heads = _unique(["Round", "Jurisdiction"] + [b["term"] for b in blocks]
                     + ["Terms mentioned"])
     ncols = len(heads)
-    _band(ws, 1, "Country matrix  -  paragraphs mentioning each term, per jurisdiction", ncols)
-    _note(ws, 2, "Each number is how many paragraphs of that jurisdiction's report mention "
-                 "the term (empty = not mentioned). 'Terms mentioned' counts how many of "
+    _band(ws, 1, f"Country matrix  -  {unit} mentioning each term, per jurisdiction", ncols)
+    _note(ws, 2, (f"Each number is how many of that jurisdiction's Key Issue Documents mention "
+                  if unit == "KIDs" else
+                  "Each number is how many paragraphs of that jurisdiction's report mention ")
+              + "the term (empty = not mentioned). 'Terms mentioned' counts how many of "
                  "the searched terms appear at all. Rounds are listed separately"
                  + (" - filter the Round column to see one." if len(labels) == 2 else "."),
           ncols, italic=True)
@@ -1601,10 +1812,40 @@ MER_HEADERS = ["Round", "Table", "Reference (for citing)", "Jurisdiction", "MEAS
                "Term in context"]
 MER_WIDTHS  = [11, 19, 36, 18, 12, 32, 8, 10, 95, 70]
 
+KID_HEADERS = ["Round", "KID", "Reference (for citing)", "Jurisdiction", "IO / Recommendation",
+               "Theme", "Plenary", "Plenary outcome", "Final rating", "Term found in"]
+KID_WIDTHS = [11, 12, 40, 18, 30, 28, 15, 15, 10, 26]
+
+def _kid_rows(ws, hr, b, sentence_only, idx):
+    """One row per KID: its details, then each part with the term in bold."""
+    heads = list(KID_HEADERS) + (["Sentences with the term"] if sentence_only
+                                 else list(KID_PART_NAMES))
+    widths = KID_WIDTHS + ([110] if sentence_only else [60] * len(KID_PART_NAMES))
+    _write_header(ws, hr, heads, widths, height=30)
+    r = hr + 1
+    for x in b["results"]:
+        _round_cell(ws.cell(row=r, column=1), x["Round"])
+        vals = [kid_short(x["KID"]), x["ref"], x["Jurisdiction"], x["Indicator"], x["Theme"],
+                plenary_label(x["Plenary"]), x["Outcome"], x["Rating"],
+                ", ".join(x.get("matched_parts") or [])]
+        for j, v in enumerate(vals, start=2):
+            c = ws.cell(row=r, column=j)
+            _setv(c, v)
+            _style(c, "wrap", alignment=WRAP)
+        variants = x.get("variants") or x["matched"]
+        texts = [x["sentence"]] if sentence_only else [pt["lines"] for pt in x["parts"]]
+        for j, v in enumerate(texts, start=len(KID_HEADERS) + 1):
+            c = ws.cell(row=r, column=j)
+            _setv(c, _rich(v, variants) if v else "")
+            _style(c, "wrap", alignment=WRAP)
+        r += 1
+    _add_table(ws, f"tTerm{idx}", hr, r - 1, len(heads))
+
 def _write_term_sheet(ws, p, b, idx):
-    is_mer = p["data_mode"] == "MER"
+    is_mer = p["data_mode"] in STRUCTURED
+    is_kid = p["data_mode"] == "KID"
     sentence_only = p.get("quote_style") == "sentence"
-    ncols = len(MER_HEADERS) if is_mer else 6
+    ncols = (len(KID_HEADERS) + 5 if is_kid else len(MER_HEADERS)) if is_mer else 6
     _band(ws, 1, f'"{b["term"]}"', ncols, size=14)
     info = []
     if len(b.get("aliases") or []) > 1:
@@ -1635,6 +1876,10 @@ def _write_term_sheet(ws, p, b, idx):
         rows = b["results"]
         if not rows:
             _setv(ws.cell(row=hr, column=1), "No mentions found.")
+            return
+        if is_kid:
+            _kid_rows(ws, hr, b, sentence_only, idx)
+            ws.freeze_panes = ws.cell(row=hr + 1, column=3)
             return
         heads = list(MER_HEADERS)
         if sentence_only:
@@ -1689,8 +1934,14 @@ def _write_term_sheet(ws, p, b, idx):
     ws.freeze_panes = ws.cell(row=hr + 1, column=1)
 
 def _write_all_hits(ws, p, blocks):
-    is_mer = p["data_mode"] == "MER"
-    if is_mer:
+    is_mer = p["data_mode"] in STRUCTURED
+    is_kid = p["data_mode"] == "KID"
+    if is_kid:
+        heads = ["Search term", "Round", "KID", "Reference (for citing)", "Jurisdiction",
+                 "IO / Recommendation", "Theme", "Plenary", "Plenary outcome",
+                 "Final rating", "Term found in", "Matched as", "Sentences with the term"]
+        widths = [26, 11, 12, 40, 18, 30, 28, 15, 15, 10, 26, 18, 90]
+    elif is_mer:
         heads = ["Search term", "Round", "Table", "Reference (for citing)", "Jurisdiction",
                  "MEASURE", "Indicator", "Rating", "Criteria rating", "Matched as",
                  "Sentence with term"]
@@ -1700,15 +1951,21 @@ def _write_all_hits(ws, p, blocks):
                  "Details"]
         widths = [26, 30, 45, 18, 90, 50]
     _band(ws, 1, "All hits  -  every hit for every term, one row each", len(heads))
-    _note(ws, 2, "One flat table for filtering, sorting and pivot tables. Full paragraphs "
-                 "are on each term's own sheet.", len(heads), italic=True)
+    _note(ws, 2, "One flat table for filtering, sorting and pivot tables. "
+                 + ("Each KID's full text is on each term's own sheet." if is_kid else
+                    "Full paragraphs are on each term's own sheet."), len(heads), italic=True)
     hr = 4
     _write_header(ws, hr, heads, widths, height=30)
     r = hr + 1
     for b in blocks:
         rows = b["results"] if is_mer else [x for fb in b["results"] for x in fb["rows"]]
         for x in rows:
-            if is_mer:
+            if is_kid:
+                vals = [b["term"], None, kid_short(x["KID"]), x["ref"], x["Jurisdiction"],
+                        x["Indicator"], x["Theme"], plenary_label(x["Plenary"]), x["Outcome"],
+                        x["Rating"], ", ".join(x.get("matched_parts") or []),
+                        ", ".join(x.get("variants") or [x["matched"]]), x["sentence"]]
+            elif is_mer:
                 vals = [b["term"], None, x["Table"], x["ref"], x["Jurisdiction"],
                         x["MEASURE"], x["Indicator"], x["Rating"], x["Criteria rating"],
                         ", ".join(x.get("variants") or [x["matched"]]), x["sentence"]]
@@ -1735,7 +1992,7 @@ def export_excel(p, blocks, export_dir):
     path = _free_path(export_dir, export_filename(p, blocks, "xlsx"))
     _TABLE_NAMES.clear()
     _STYLE_CACHE.clear()          # style records belong to one workbook
-    is_mer = p["data_mode"] == "MER"
+    is_mer = p["data_mode"] in STRUCTURED
     labels = blocks[0]["rounds"] if (blocks and is_mer) else []
     wb = Workbook()
     ws0 = wb.active
@@ -1915,7 +2172,7 @@ def pretty_measure(m):
     m = str(m or "")
     mm = re.match(r'IO(\d+)', m)
     if mm: return "IO.%s" % mm.group(1)
-    mm = re.match(r'R(\d+)_', m)
+    mm = re.match(r'R(\d+)(_|$)', m)
     if mm: return "R.%s" % mm.group(1)
     if m.startswith("EXECSUM"): return "Executive summary"
     if m.startswith("RC") or m.startswith("MLTF"): return "Risk and context"
@@ -1936,6 +2193,41 @@ def _round_tag(lab):
 def _cov_txt(cov):
     return "%s of %s (%s%%)" % (cov.get("mentioned", 0), cov.get("total", 0), cov.get("pct", 0))
 
+KID_DECISION_COLOR = {"Upgrade": "2F7A4F", "Downgrade": "A63A2A"}
+
+def _kid_word(x, lab, sentence_only):
+    """One KID in the Word report: a heading line, then its parts."""
+    out = []
+    head = kid_short(x["KID"])
+    if x.get("MEASURE"):
+        head += "  ·  " + pretty_measure(x["MEASURE"])
+    head += "  ·  " + x["Theme"]
+    out.append(_para([_round_tag(lab), _run(head, size="19", color="1E2F4D", bold=True)],
+                     after=30, before=150))
+    meta = [_run(plenary_label(x["Plenary"]) + " Plenary  ·  ", size="18", color="54677F"),
+            _run(x["Outcome"], size="18", bold=True,
+                 color=KID_DECISION_COLOR.get(x["Outcome"], "54677F"))]
+    if x.get("Rating") and x["Rating"] != "NA":
+        meta.append(_run("  ·  final rating " + x["Rating"], size="18", color="54677F"))
+    meta.append(_run("  ·  term found in: " + ", ".join(x.get("matched_parts") or []),
+                     size="18", color="54677F", italic=True))
+    out.append(_para(meta, after=60))
+    if sentence_only:
+        out.append(_para(_highlight_runs(x["sentence"], x.get("variants")),
+                         after=110, shade="F7FAFD"))
+        return out
+    for pt in x["parts"]:
+        if not pt["lines"]:
+            continue
+        out.append(_para([_run(pt["part"] + ("" if pt["hit"] else ""), bold=True, size="17",
+                               color="B4472C" if pt["hit"] else "54677F")], after=20, before=40))
+        for line in pt["lines"].split("\n"):
+            out.append(_para(_highlight_runs(line, x.get("variants"), base_size="20"),
+                             after=40, shade="FBF3EE" if pt["hit"] else "F7F7F5"))
+    out.append(_para([_run("Reference: " + x["ref"], italic=True, size="16", color="54677F")],
+                     after=120))
+    return out
+
 def build_word_report(p, blocks, export_dir):
     os.makedirs(export_dir, exist_ok=True)
     path = _free_path(export_dir, export_filename(p, blocks, "docx"))
@@ -1943,7 +2235,10 @@ def build_word_report(p, blocks, export_dir):
              or (blocks[0]["term"] if blocks else "Search results"))
     src_label = blocks[0]["source_label"] if blocks else ""
     today = datetime.now().strftime("%d %B %Y")
-    is_mer = p["data_mode"] == "MER"
+    is_mer = p["data_mode"] in STRUCTURED
+    is_kid = p["data_mode"] == "KID"
+    tbls = tables_for(p["data_mode"])
+    unit = "KID" if is_kid else "mention"
     labels = blocks[0]["rounds"] if (blocks and is_mer) else []
     two = len(labels) == 2
     sentence_only = (p.get("quote_style") == "sentence")
@@ -1952,20 +2247,22 @@ def build_word_report(p, blocks, export_dir):
     # ---------- cover ----------
     B.append(_para([_run("FATF SEARCH TOOL", bold=True, color="2C5F8A", size="19")], after=60))
     B.append(_para([_run(title, bold=True, color="1E2F4D", size="44")], after=80))
-    B.append(_para([_run("Mentions in " + src_label.replace("MER ", "")
-                         + (" Mutual Evaluation Reports" if is_mer else "")
+    B.append(_para([_run(("Key Issue Documents that mention the terms, " + src_label.split(", ")[-1]
+                          if is_kid else "Mentions in " + src_label.replace("MER ", "")
+                         + (" Mutual Evaluation Reports" if is_mer else ""))
                          + ", with context and statistics",
                          italic=True, color="54677F", size="23")], after=200, border=True))
     cover = [[("Prepared", True), today], [("Source", True), src_label]]
     if is_mer:
-        df_all = load_mer(p["round"])
+        df_all = load_struct(p)
         gf = dict(p.get("filters") or {})
         for lab in labels:
             tot = int(apply_filters(df_all[df_all["Round"] == lab], gf)["Jurisdiction"].nunique())
             n = sum(1 for b in blocks for x in b["results"] if x["Round"] == lab)
             cover.append([(lab[0].upper() + lab[1:], True),
-                          "%d mention%s  ·  %d jurisdictions assessed" %
-                          (n, "" if n == 1 else "s", tot)])
+                          "%d %s%s  ·  %d jurisdictions %s" %
+                          (n, unit, "" if n == 1 else "s", tot,
+                           "with KIDs" if is_kid else "assessed")])
     else:
         cover.append([("Total mentions", True), str(sum(_count(b) for b in blocks))])
     cover.append([("Terms searched", True), ", ".join(b["term"] for b in blocks)[:700]])
@@ -1977,6 +2274,11 @@ def build_word_report(p, blocks, export_dir):
     B.append(_para([_run("How to use this document", bold=True, color="1E2F4D", size="21")],
                    before=200, after=80))
     how = ["Section 1 gives the headline numbers for every term.",
+           ] + (["A Key Issue Document (KID) records an issue the Plenary discussed during the "
+                 "adoption of a mutual evaluation: the key issue, the ECG discussion, the ECG "
+                 "proposal, the Plenary discussion and the Plenary decision. Each KID counts "
+                 "once, however many of its parts mention the term; the parts that do are "
+                 "marked."] if is_kid else []) + [
            "Each term then has its own section: statistics first, then every mention "
            "grouped by country, with the search term in bold.",
            "Every quote carries a reference line (round, country, Immediate Outcome or "
@@ -1997,8 +2299,8 @@ def build_word_report(p, blocks, export_dir):
     B.append(_para([_run("1.  Overview", bold=True, color="1E2F4D", size="30")],
                    style="Heading1", before=340, after=140, border=True))
     if is_mer and two:
-        rows = [[("Term", True), ("4th round mentions", True), ("4th round countries", True),
-                 ("5th round mentions", True), ("5th round countries", True)]]
+        rows = [[("Term", True), ("4th round %ss" % unit, True), ("4th round countries", True),
+                 ("5th round %ss" % unit, True), ("5th round countries", True)]]
         for b in blocks:
             row = [b["term"][:40]]
             for lab in labels:
@@ -2008,14 +2310,14 @@ def build_word_report(p, blocks, export_dir):
         B.append(_table(rows, [2800, 1350, 1900, 1350, 1900]))
     elif is_mer:
         lab = labels[0]
-        rows = [[("Term", True), ("Mentions", True), ("Countries", True), ("Effect.", True),
-                 ("Risk & ctx", True), ("Tech. comp.", True)]]
+        short = {"Effectiveness": "Effect.", "Risk and Context": "Risk & ctx",
+                 "Technical Compliance": "Tech. comp.", "General": "General"}
+        rows = [[("Term", True), ("KIDs" if is_kid else "Mentions", True), ("Countries", True)]
+                + [(short[t], True) for t in tbls]]
         for b in blocks:
             n2 = Counter(x["Table"] for x in b["results"])
             rows.append([b["term"][:40], str(len(b["results"])),
-                         _cov_txt(b["coverage"][lab]),
-                         str(n2.get("Effectiveness", 0)), str(n2.get("Risk and Context", 0)),
-                         str(n2.get("Technical Compliance", 0))])
+                         _cov_txt(b["coverage"][lab])] + [str(n2.get(t, 0)) for t in tbls])
         B.append(_table(rows, [2700, 1100, 1900, 1150, 1250, 1300]))
     else:
         rows = [[("Term", True), ("Mentions", True), ("Where they are", True)]]
@@ -2052,19 +2354,27 @@ def build_word_report(p, blocks, export_dir):
                 rr = [x for x in rows_all if x["Round"] == lab]
                 cov = b["coverage"][lab]
                 n2 = Counter(x["Table"] for x in rr)
-                meas = Counter(pretty_measure(x["MEASURE"]) for x in rr)
+                meas = Counter(pretty_measure(x["MEASURE"]) for x in rr if x["MEASURE"])
                 rat = Counter(x["Rating"] for x in rr if x.get("Rating") and x["Rating"] != "NA")
                 top = Counter(x["Jurisdiction"] for x in rr)
-                return [str(len(rr)), _cov_txt(cov),
-                        str(n2.get("Effectiveness", 0)), str(n2.get("Risk and Context", 0)),
-                        str(n2.get("Technical Compliance", 0)),
+                out = [str(len(rr)), _cov_txt(cov)] + [str(n2.get(t, 0)) for t in tbls] + [
                         ", ".join("%s (%d)" % kv for kv in meas.most_common(5)) or "-",
                         ", ".join("%s (%d)" % kv for kv in rat.most_common()) or "-",
                         ", ".join("%s (%d)" % kv for kv in top.most_common(6)) or "-"]
+                if is_kid:
+                    dec = Counter(x["Outcome"] for x in rr)
+                    out.append(", ".join("%s (%d)" % kv for kv in dec.most_common()) or "-")
+                return out
             cols = [per(lab) for lab in labels]
-            names = ["Mentions", "Countries mentioning it", "In effectiveness chapters",
-                     "In risk and context", "In technical compliance", "Comes up most under",
-                     "Ratings on those paragraphs", "Most mentions"]
+            tname = {"Effectiveness": "In effectiveness " + ("KIDs" if is_kid else "chapters"),
+                     "Risk and Context": "In risk and context",
+                     "Technical Compliance": "In technical compliance" + (" KIDs" if is_kid else ""),
+                     "General": "In general KIDs (no IO or R)"}
+            names = (["KIDs mentioning it" if is_kid else "Mentions", "Countries mentioning it"]
+                     + [tname[t] for t in tbls]
+                     + ["Comes up most under",
+                        "Final ratings after the Plenary" if is_kid else "Ratings on those paragraphs",
+                        "Most mentions"] + (["Plenary decisions"] if is_kid else []))
             for k, nm in enumerate(names):
                 stat_rows.append([nm] + [c[k] for c in cols])
             widths = [2600, 3400, 3400] if two else [3000, 6400]
@@ -2101,6 +2411,16 @@ def build_word_report(p, blocks, export_dir):
                     bycountry[x["Jurisdiction"]].append(x)
                 for country in sorted(bycountry):
                     items = bycountry[country]
+                    if is_kid:
+                        B.append(_para([_run(country + "  ", bold=True, size="22"),
+                                        _run("(%d KID%s%s)" % (len(items),
+                                             "s" if len(items) > 1 else "",
+                                             ", " + lab if two else ""),
+                                             size="19", color="54677F")],
+                                       style="Heading3", before=180, after=70))
+                        for x in items:
+                            B.extend(_kid_word(x, lab, sentence_only))
+                        continue
                     B.append(_para([_run(country + "  ", bold=True, size="22"),
                                     _run("(%d mention%s%s)" % (len(items),
                                          "s" if len(items) > 1 else "",
@@ -2222,7 +2542,7 @@ def indicator_facet(df):
     """Indicators grouped by table, then by IO / recommendation."""
     u = df[df["Indicator"] != ""][["Table", "MEASURE", "Indicator"]].drop_duplicates()
     tree = []
-    for tbl in TABLES:
+    for tbl in TABLES + ["General"]:
         part = u[u["Table"] == tbl]
         if part.empty:
             continue
@@ -2248,8 +2568,9 @@ def _rating_sort(c):
 
 def rating_facet(df):
     tree = []
-    eff = set(df.loc[df["Table"] == "Effectiveness", "Rating"]) - {"", "NA"}
-    tc = set(df.loc[df["Table"] == "Technical Compliance", "Rating"]) - {"", "NA"}
+    allr = set(df["Rating"]) - {"", "NA"}
+    eff = allr & {"HE", "SE", "ME", "LE"}
+    tc = allr - eff
     if eff:
         tree.append({"id": "eff", "name": "Effectiveness ratings",
                      "items": sorted(eff, key=_rating_sort)})
@@ -2257,12 +2578,47 @@ def rating_facet(df):
         tree.append({"id": "tc", "name": "Technical compliance ratings",
                      "items": sorted(tc - eff, key=_rating_sort)})
     if (df["Rating"] == "NA").any():
-        tree.append({"id": "na", "name": "No rating (Risk and Context)", "items": ["NA"]})
+        tree.append({"id": "na", "name": "No rating", "items": ["NA"]})
     return {"tree": tree, "presets": []}
 
 def crit_facet(df):
     vals = sorted((x for x in df["Criteria rating"].unique().tolist() if x), key=_rating_sort)
     return {"tree": [{"id": "all", "name": "", "items": vals}], "presets": []}
+
+def kid_theme_facet(df):
+    """Themes grouped by table, then by IO / Recommendation."""
+    u = df[["Table", "Indicator", "ThemeCode", "Theme"]].drop_duplicates("ThemeCode")
+    labels = dict(zip(u["ThemeCode"], u["Theme"]))
+    tree = []
+    for tbl in KID_TABLES:
+        part = u[u["Table"] == tbl]
+        if part.empty:
+            continue
+        groups = []
+        for ind in sorted(part["Indicator"].unique().tolist(), key=_measure_key):
+            codes = part[part["Indicator"] == ind]
+            codes = sorted(codes["ThemeCode"].tolist(), key=lambda c: labels[c].lower())
+            groups.append({"id": f"{tbl}|{ind}", "name": ind, "items": codes})
+        tree.append({"id": tbl, "name": tbl, "children": groups})
+    return {"tree": tree, "presets": [], "labels": labels}
+
+def kid_plenary_facet(df):
+    codes = sorted(df["Plenary"].unique().tolist())
+    years = OrderedDict()
+    for c in codes:
+        years.setdefault(c[:4], []).append(c)
+    tree = [{"id": "y" + y, "name": y, "items": v} for y, v in reversed(years.items())]
+    return {"tree": tree, "presets": [], "labels": {c: plenary_label(c) for c in codes}}
+
+def kid_facets(df):
+    outs = [o for o in ("Upgrade", "Downgrade", "Text amendment")
+            if o in set(df["Outcome"])] + sorted(set(df["Outcome"]) - {"Upgrade", "Downgrade",
+                                                                       "Text amendment"})
+    return {"jur": jurisdiction_facet(df), "ind": indicator_facet(df),
+            "theme": kid_theme_facet(df),
+            "part": {"tree": [{"id": "all", "name": "", "items": KID_PART_NAMES}], "presets": []},
+            "outc": {"tree": [{"id": "all", "name": "", "items": outs}], "presets": []},
+            "plen": kid_plenary_facet(df), "rat": rating_facet(df)}
 
 def _err(e):
     return jsonify({"ok": False, "error": f"{e}", "trace": traceback.format_exc()})
@@ -2272,6 +2628,22 @@ def api_load():
     try:
         p = request.get_json(force=True)
         set_paths(p.get("paths"))
+        if p["data_mode"] == "KID":
+            df = load_kid(p["round"])
+            per = []
+            for lab in round_labels(p["round"]):
+                d = df[df["Round"] == lab]
+                per.append({"round": lab, "rows": int(d["KID"].nunique()),
+                            "n_jurisdictions": int(d["Jurisdiction"].nunique()),
+                            "counts": {k: int(v) for k, v in
+                                       d.drop_duplicates("KID")["Table"].value_counts().items()}})
+            return jsonify({
+                "ok": True, "rounds": per, "unit": "KID",
+                "total": int(df["KID"].nunique()),
+                "n_jurisdictions": int(df["Jurisdiction"].nunique()),
+                "file": os.path.basename(kid_file()),
+                "facets": kid_facets(df),
+                "labels": {c: rating_option(c) for c in set(df["Rating"].unique()) if c}})
         if p["data_mode"] == "MER":
             per = []
             for r in rounds_of(p["round"]):
@@ -2310,7 +2682,7 @@ def _summary(p, b):
     out = {"term": b["term"], "aliases": b.get("aliases", []), "scope": b.get("scope"),
            "notes": b.get("notes", []), "how": b.get("how", []),
            "warn": b.get("warn", []), "forms": b.get("forms", [])}
-    if p["data_mode"] == "MER":
+    if p["data_mode"] in STRUCTURED:
         res = b["results"]
         out["total"] = len(res)
         out["rounds"] = b["rounds"]
@@ -2322,7 +2694,7 @@ def _summary(p, b):
                             "by_round": {lab: sum(1 for x in res if x["Table"] == t
                                                   and x["Round"] == lab)
                                          for lab in b["rounds"]}}
-                           for t in TABLES]
+                           for t in tables_for(p["data_mode"])]
     else:
         out["total"] = sum(len(fb["rows"]) for fb in b["results"])
         out["rounds"] = []
@@ -2341,7 +2713,7 @@ def api_search():
         raw = get_raw(p, sid)
         blocks = finalize(p, raw)
         return jsonify({"ok": True, "sid": sid, "data_mode": p["data_mode"],
-                        "rounds": round_labels(p["round"]) if p["data_mode"] == "MER" else [],
+                        "rounds": round_labels(p["round"]) if p["data_mode"] in STRUCTURED else [],
                         "page_size": PAGE_SIZE,
                         "results": [_summary(p, b) for b in blocks]})
     except Exception as e:
@@ -2364,7 +2736,7 @@ def api_rows():
         b = ent["raw"][int(p.get("term_index", 0))]
         sec = str(p.get("section", ""))
         rnd = p.get("round") or "all"
-        if ent["data_mode"] == "MER":
+        if ent["data_mode"] in STRUCTURED:
             rows = [x for x in b["results"] if x["Table"] == sec
                     and (rnd == "all" or x["Round"] == rnd)]
         else:
@@ -2382,10 +2754,10 @@ def api_interpret():
     try:
         p = request.get_json(force=True)
         known = None
-        if p.get("data_mode") == "MER":
+        if p.get("data_mode") in STRUCTURED:
             try:
                 set_paths(p.get("paths"))
-                known = sorted(load_mer(p["round"])["Jurisdiction"].unique().tolist())
+                known = sorted(load_struct(p)["Jurisdiction"].unique().tolist())
             except Exception:
                 known = None
         out, seen_labels = [], {}
@@ -2460,54 +2832,51 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MER Search</title>
+<title>FATF Search Tool</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&family=DM+Mono:wght@400;500&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;650;700&display=swap" rel="stylesheet">
 <style>
 /* =====================================================================
-   Tokens
+   Tokens: warm paper, terracotta, plain professional type
    ===================================================================== */
 :root{
-  --canvas:#f3ece3; --surface:#fbf8f4; --sunk:#f1e9df; --doc:#fdfbf8;
-  --glass:rgba(253,250,246,.62); --glass-edge:rgba(255,255,255,.85);
-  --ink:#1c1916; --muted:#6b625a; --faint:#9c9187;
-  --rule:#e6dcd0; --rule2:#d6c8b8;
-  --accent:#b4472c; --accent-strong:#933720; --accent-soft:#f5e3d9; --on-accent:#fdf8f3;
-  --mark:#f3cdb7; --mark-ink:#3a160a;
-  --box:#f4e8dd; --box-rule:#b4472c;
-  --eff:#4a6a86; --rc:#62805a; --tc:#b07a2e; --oth:#8a8077;
-  --good:#3f7a52; --good-soft:#e3efe2;
-  --mid:#3f6688;  --mid-soft:#e2eaf1;
-  --warn:#9a6a12; --warn-soft:#f7ebcf;
-  --bad:#a63a2a;  --bad-soft:#f6e0da;
-  --na:#8a8077;   --na-soft:#efe8e0;
-  --r4:#6a4c7c; --r4-soft:#eee4f1;
+  --canvas:#f4eee6; --surface:#fffdfa; --sunk:#f6f0e8; --doc:#fffdfa;
+  --ink:#1f1b17; --muted:#665d55; --faint:#978c81;
+  --rule:#e8dfd4; --rule2:#d9cbbb;
+  --accent:#b4472c; --accent-strong:#933720; --accent-soft:#f8e7de; --on-accent:#ffffff;
+  --mark:#f7d6c4; --mark-ink:#3a160a;
+  --box:#f6ebe1; --box-rule:#b4472c;
+  --eff:#4a6a86; --rc:#62805a; --tc:#b07a2e; --gen:#8a7f74; --oth:#8a8077;
+  --good:#2f7a4f; --good-soft:#e2f0e5;
+  --mid:#3f6688;  --mid-soft:#e3ebf2;
+  --warn:#94660f; --warn-soft:#f8ecd1;
+  --bad:#a63a2a;  --bad-soft:#f8e1db;
+  --na:#7f756c;   --na-soft:#efe9e2;
+  --r4:#6a4c7c; --r4-soft:#efe6f2;
   --r5:#2f6b66; --r5-soft:#dff0ec;
-  --lift:0 1px 1px rgba(60,35,20,.04),0 18px 40px -22px rgba(90,50,25,.28);
-  --sans:'Instrument Sans','Segoe UI',system-ui,sans-serif;
-  --display:'Instrument Serif','Didot','Bodoni MT',Georgia,serif;
-  --serif:'Source Serif 4',Georgia,'Times New Roman',serif;
-  --mono:'DM Mono',ui-monospace,Consolas,monospace;
+  --shadow:0 1px 2px rgba(60,35,20,.05),0 10px 30px -18px rgba(90,50,25,.25);
+  --sans:'Instrument Sans','Segoe UI',system-ui,-apple-system,sans-serif;
+  --mono:ui-monospace,'Cascadia Mono',Consolas,monospace;
+  --r-sm:6px; --r-md:10px;
   color-scheme:light;
 }
 body.dark{
-  --canvas:#1a1613; --surface:#231e1a; --sunk:#2b2520; --doc:#26201c;
-  --glass:rgba(38,32,28,.7); --glass-edge:rgba(255,240,225,.08);
-  --ink:#f1e8de; --muted:#b9ab9d; --faint:#85786c;
-  --rule:#3a312a; --rule2:#4a3f36;
-  --accent:#e2795a; --accent-strong:#f09a7e; --accent-soft:#3d241b; --on-accent:#1e0f09;
-  --mark:#7a3a22; --mark-ink:#ffe9dc;
-  --box:#33271f; --box-rule:#e2795a;
-  --eff:#8fb0cc; --rc:#9cbc92; --tc:#dcae66; --oth:#a99c90;
+  --canvas:#1b1714; --surface:#25201c; --sunk:#2c2621; --doc:#25201c;
+  --ink:#f2eae1; --muted:#bbaea0; --faint:#877a6e;
+  --rule:#3a322b; --rule2:#4b4037;
+  --accent:#e57d5d; --accent-strong:#f39a7e; --accent-soft:#3e251c; --on-accent:#1e0f09;
+  --mark:#74361f; --mark-ink:#ffeadf;
+  --box:#31261f; --box-rule:#e57d5d;
+  --eff:#8fb0cc; --rc:#9cbc92; --tc:#dcae66; --gen:#b3a596; --oth:#a99c90;
   --good:#8cc79a; --good-soft:#1f3123;
   --mid:#90b4d6;  --mid-soft:#1e2c39;
   --warn:#e0b45c; --warn-soft:#382c14;
-  --bad:#ec8f7c;  --bad-soft:#3e211b;
-  --na:#a99c90;   --na-soft:#2e2722;
-  --r4:#c7a6dc; --r4-soft:#33263b;
+  --bad:#ef917e;  --bad-soft:#3f221c;
+  --na:#a99c90;   --na-soft:#2f2823;
+  --r4:#c9a8de; --r4-soft:#34273c;
   --r5:#7fc8bf; --r5-soft:#1b322f;
-  --lift:0 1px 1px rgba(0,0,0,.3),0 18px 40px -20px rgba(0,0,0,.7);
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 30px -18px rgba(0,0,0,.7);
   color-scheme:dark;
 }
 
@@ -2516,141 +2885,139 @@ body.dark{
    ===================================================================== */
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{margin:0;font-family:var(--sans);color:var(--ink);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
-  background:radial-gradient(1200px 700px at 8% -10%,#fbf6f0 0,transparent 60%),
-    radial-gradient(900px 600px at 105% 15%,#ecdccb 0,transparent 65%),var(--canvas);background-attachment:fixed}
-body.dark{background:radial-gradient(1000px 600px at 105% 10%,#2c211a 0,transparent 65%),var(--canvas);background-attachment:fixed}
-/* small spaced capitals with a spark, as in the reference */
-.eyebrow{font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--accent)}
-.eyebrow::before{content:'\2726';margin-right:8px;font-size:10px}
+body{margin:0;font-family:var(--sans);color:var(--ink);font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased;
+  background:radial-gradient(1100px 600px at 100% -5%,#efdfcf 0,transparent 60%),var(--canvas);background-attachment:fixed;
+  font-variant-numeric:tabular-nums}
+body.dark{background:radial-gradient(1000px 600px at 100% 0,#2c211a 0,transparent 60%),var(--canvas);background-attachment:fixed}
 button,input,select,textarea{font:inherit;color:inherit}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
-code{font-family:var(--mono);font-size:.9em;background:var(--sunk);border:1px solid var(--rule);
-  padding:0 .3em;border-radius:4px}
+code{font-family:var(--mono);font-size:.88em;background:var(--sunk);border:1px solid var(--rule);padding:0 .35em;border-radius:4px}
+.sr{position:absolute;left:0;top:0;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 @media (prefers-reduced-motion: reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
   html{scroll-behavior:auto}
 }
-
-/* the highlighter: the one loud thing on the page */
-mark,.hl{color:var(--mark-ink);font-weight:600;border-radius:.3em .15em .35em .2em;
-  padding:.02em .08em;margin:0 -.08em;-webkit-box-decoration-break:clone;box-decoration-break:clone;
-  background:linear-gradient(100deg,color-mix(in srgb,var(--mark) 55%,transparent) 0,
-    var(--mark) .3em,var(--mark) calc(100% - .3em),color-mix(in srgb,var(--mark) 65%,transparent) 100%)}
+mark{color:var(--mark-ink);background:var(--mark);font-weight:600;border-radius:3px;padding:0 .12em;margin:0 -.04em;
+  -webkit-box-decoration-break:clone;box-decoration-break:clone}
 
 /* =====================================================================
    Top bar
    ===================================================================== */
-.top{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:16px;height:64px;
-  padding:0 28px;background:color-mix(in srgb,var(--canvas) 78%,transparent);backdrop-filter:blur(14px);
-  -webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--rule)}
-.brand{display:flex;align-items:center;gap:12px;min-width:0}
-.brandmark{font-size:22px;line-height:1;color:var(--accent);flex-shrink:0}
-.brandmark::before{content:'\2726'}
-.brandname{font-family:var(--display);font-weight:400;font-size:25px;letter-spacing:-.01em;line-height:1}
-.brandname i{color:var(--accent)}
-.brandsub{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.srcchip{display:none;align-items:center;gap:8px;padding:5px 12px;border-radius:99px;
-  border:1px solid var(--rule2);background:var(--glass);color:var(--muted);font-size:12.5px;font-weight:500;white-space:nowrap}
-.srcchip .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
-.spinner{display:none;width:16px;height:16px;border:2px solid var(--rule2);border-top-color:var(--accent);
-  border-radius:50%;animation:spin .7s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.iconbtn{border:1px solid var(--rule2);background:transparent;color:var(--muted);border-radius:3px;
-  padding:7px 12px;cursor:pointer;font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;white-space:nowrap}
-.iconbtn:hover{border-color:var(--rule2);color:var(--ink)}
+.top{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:14px;height:62px;padding:0 28px;
+  background:color-mix(in srgb,var(--canvas) 82%,transparent);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--rule)}
 .top .grow{flex:1}
-.sr{position:absolute;left:0;top:0;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
-table.results th{position:relative}
+.brand{display:flex;align-items:center;gap:11px;min-width:0}
+.brandmark{width:30px;height:30px;border-radius:8px;background:var(--accent);color:var(--on-accent);display:grid;place-items:center;
+  font-size:15px;flex-shrink:0}
+.brandmark::before{content:'\2726'}
+.brandname{font-weight:700;font-size:16px;letter-spacing:-.01em;line-height:1.15}
+.brandsub{font-size:12px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.srcchip{display:none;align-items:center;gap:8px;padding:5px 12px;border-radius:99px;border:1px solid var(--rule2);
+  background:var(--surface);color:var(--muted);font-size:12.5px;font-weight:500;white-space:nowrap}
+.srcchip .dot{width:7px;height:7px;border-radius:50%;background:var(--good)}
+.spinner{display:none;width:16px;height:16px;border:2px solid var(--rule2);border-top-color:var(--accent);border-radius:50%;
+  animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.iconbtn{border:1px solid var(--rule2);background:var(--surface);color:var(--muted);border-radius:var(--r-sm);padding:6px 12px;
+  cursor:pointer;font-size:13px;font-weight:500;white-space:nowrap}
+.iconbtn:hover{color:var(--ink);border-color:var(--faint)}
 
 /* =====================================================================
    Layout
    ===================================================================== */
-.layout{display:grid;grid-template-columns:340px minmax(0,1fr);gap:32px;padding:32px 28px;
-  max-width:1640px;margin:0 auto;align-items:start}
-.rail{position:sticky;top:84px;max-height:calc(100vh - 104px);overflow-y:auto;display:flex;flex-direction:column;
-  gap:2px;padding-right:4px;scrollbar-width:thin}
-.panel{padding:18px 2px 22px;border-bottom:1px solid var(--rule)}
-.panel:last-child{border-bottom:0}
-.ptitle{font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);
-  margin:0 0 14px;display:flex;align-items:center;gap:8px}
-.ptitle::before{content:'\2726';font-size:10px}
-.ptitle .sub{font-weight:400;font-size:12.5px;color:var(--faint)}
-.main{min-width:0}
+.layout{display:grid;grid-template-columns:350px minmax(0,1fr);gap:28px;padding:28px;max-width:1660px;margin:0 auto;align-items:start}
+.rail{position:sticky;top:86px;max-height:calc(100vh - 106px);overflow-y:auto;display:flex;flex-direction:column;gap:14px;
+  padding:0 4px 8px 0;scrollbar-width:thin}
+.panel{background:var(--surface);border:1px solid var(--rule);border-radius:var(--r-md);padding:16px;box-shadow:var(--shadow)}
+.main{min-width:0;display:flex;flex-direction:column;gap:20px}
+.ptitle{display:flex;align-items:center;gap:9px;margin:0 0 12px;font-size:14.5px;font-weight:650;letter-spacing:-.005em}
+.step{width:22px;height:22px;border-radius:50%;background:var(--accent-soft);color:var(--accent);display:inline-grid;place-items:center;
+  font-size:12px;font-weight:700;flex-shrink:0}
+.ptitle .sub{margin-left:auto;font-size:12px;font-weight:500;color:var(--faint)}
 
-label{display:block;margin:12px 0 5px;font-weight:600;font-size:12.5px;color:var(--muted)}
+label{display:block;margin:12px 0 5px;font-weight:600;font-size:13px;color:var(--ink)}
 label .opt{font-weight:400;color:var(--faint)}
-select,textarea,input[type=text],input[type=search]{width:100%;padding:8px 10px;border:1px solid var(--rule2);
-  border-radius:4px;background:var(--surface);color:var(--ink);font-size:13.5px;transition:border-color .15s,box-shadow .15s}
+select,textarea,input[type=text],input[type=search]{width:100%;padding:8px 11px;border:1px solid var(--rule2);border-radius:var(--r-sm);
+  background:var(--surface);color:var(--ink);font-size:14px;transition:border-color .15s,box-shadow .15s}
 select:focus,textarea:focus,input[type=text]:focus,input[type=search]:focus{outline:none;border-color:var(--accent);
-  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 20%,transparent)}
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 18%,transparent)}
 input[type=range]{width:100%;accent-color:var(--accent)}
-input[type=checkbox]{accent-color:var(--accent)}
+input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 
-.seg{display:flex;background:var(--sunk);border:1px solid var(--rule);border-radius:5px;padding:3px;gap:2px}
-.seg button{flex:1;padding:7px 6px;border:0;border-radius:3px;background:transparent;color:var(--muted);
-  cursor:pointer;font-weight:500;font-size:13px;white-space:nowrap;transition:background .15s,color .15s}
+/* source picker: one card per source */
+.srcpick{display:flex;flex-direction:column;gap:6px}
+.srcopt{display:flex;align-items:flex-start;gap:11px;width:100%;text-align:left;padding:10px 12px;border:1px solid var(--rule2);
+  border-radius:var(--r-sm);background:var(--surface);cursor:pointer;transition:border-color .15s,background .15s}
+.srcopt:hover{border-color:var(--faint)}
+.srcopt .radio{width:16px;height:16px;border-radius:50%;border:1.5px solid var(--rule2);margin-top:2px;flex-shrink:0;display:grid;place-items:center}
+.srcopt b{display:block;font-size:14px;font-weight:600}
+.srcopt span.d{display:block;font-size:12.5px;color:var(--muted);line-height:1.4;margin-top:1px}
+.srcopt.on{border-color:var(--accent);background:color-mix(in srgb,var(--accent-soft) 55%,var(--surface));box-shadow:inset 3px 0 0 var(--accent)}
+.srcopt.on .radio{border-color:var(--accent)}
+.srcopt.on .radio::after{content:'';width:8px;height:8px;border-radius:50%;background:var(--accent)}
+
+.seg{display:flex;background:var(--sunk);border:1px solid var(--rule);border-radius:var(--r-sm);padding:3px;gap:2px}
+.seg button{flex:1;padding:7px 8px;border:0;border-radius:4px;background:transparent;color:var(--muted);cursor:pointer;
+  font-weight:500;font-size:13px;white-space:nowrap;transition:background .15s,color .15s}
 .seg button:hover{color:var(--ink)}
-.seg button.on{background:var(--surface);color:var(--ink);font-weight:600;
-  box-shadow:0 1px 2px rgba(60,35,20,.12),inset 0 -2px 0 var(--accent)}
+.seg button.on{background:var(--surface);color:var(--accent);font-weight:600;box-shadow:0 1px 2px rgba(60,35,20,.14)}
 .seg.mini{display:inline-flex}
 .seg.mini button{flex:none;padding:4px 12px;font-size:12.5px}
 
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:11px 18px;border:1px solid transparent;
-  border-radius:3px;cursor:pointer;font-family:var(--mono);font-weight:500;font-size:11.5px;letter-spacing:.12em;text-transform:uppercase;
-  transition:background .15s,border-color .15s,color .15s,box-shadow .15s}
-.btn.primary{background:var(--accent);color:var(--on-accent);box-shadow:0 8px 20px -10px color-mix(in srgb,var(--accent) 70%,transparent)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:9px 18px;border:1px solid transparent;
+  border-radius:var(--r-sm);cursor:pointer;font-weight:600;font-size:14px;transition:background .15s,border-color .15s,color .15s,box-shadow .15s}
+.btn.primary{background:var(--accent);color:var(--on-accent);box-shadow:0 1px 2px rgba(120,40,20,.25)}
 .btn.primary:hover{background:var(--accent-strong)}
-.btn.ghost{background:transparent;color:var(--accent);border-color:color-mix(in srgb,var(--accent) 55%,var(--rule))}
+.btn.ghost{background:var(--surface);color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,var(--rule2))}
 .btn.ghost:hover{background:var(--accent-soft)}
 .btn.grey{background:transparent;color:var(--muted);border-color:var(--rule2)}
 .btn.grey:hover{color:var(--ink);background:var(--sunk)}
 .btn.wide{width:100%}
 .btn:disabled{opacity:.45;cursor:not-allowed}
+.btn svg{width:15px;height:15px}
 .linkbtn{background:none;border:0;color:var(--accent);cursor:pointer;font-weight:600;font-size:inherit;padding:0;
   text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:3px}
 .linkbtn:hover{color:var(--accent-strong)}
 
-.status{font-size:12.5px;color:var(--muted);margin-top:10px;white-space:pre-wrap;line-height:1.6}
+.status{font-size:13px;color:var(--muted);margin-top:10px;white-space:pre-wrap;line-height:1.6}
 .status.err{color:var(--bad)}
-.hint{font-size:12px;color:var(--faint);margin-top:6px;line-height:1.5}
-.kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--rule2);border-bottom-width:2px;border-radius:4px;
-  padding:0 4px;background:var(--sunk);color:var(--muted)}
-.checkline{display:flex;align-items:flex-start;gap:9px;margin:10px 0 0;font-size:13px;font-weight:400;color:var(--ink);cursor:pointer}
-.checkline input{width:16px;height:16px;margin:1px 0 0;flex-shrink:0;cursor:pointer}
-
-.pathtoggle{margin-top:12px}
+.status.ok{color:var(--good)}
+.hint{font-size:12.5px;color:var(--faint);margin-top:6px;line-height:1.5}
+.kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--rule2);border-bottom-width:2px;border-radius:4px;padding:0 4px;
+  background:var(--sunk);color:var(--muted)}
+.checkline{display:flex;align-items:flex-start;gap:9px;margin:10px 0 0;font-size:13.5px;font-weight:400;color:var(--ink);cursor:pointer}
+.checkline input{width:16px;height:16px;margin:2px 0 0;flex-shrink:0;cursor:pointer}
+.pathtoggle{margin-top:12px;font-size:13px}
 #pathFields{margin-top:4px}
-.roundhint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.5}
+.roundhint{font-size:12.5px;color:var(--muted);margin-top:7px;line-height:1.5}
+.sublabel{font-size:12.5px;font-weight:600;color:var(--muted);margin:14px 0 6px}
 
 /* =====================================================================
    Filters (rail)
    ===================================================================== */
-.ftop{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.ftop{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .ftop .ptitle{margin:0}
-.expandbtn{margin-left:auto;display:inline-flex;align-items:center;gap:6px;border:1px solid color-mix(in srgb,var(--accent) 50%,var(--rule2));
-  background:transparent;color:var(--accent);border-radius:3px;padding:6px 10px;cursor:pointer;font-family:var(--mono);font-size:10.5px;
-  letter-spacing:.12em;text-transform:uppercase}
+.expandbtn{margin-left:auto;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--rule2);background:var(--surface);
+  color:var(--accent);border-radius:var(--r-sm);padding:5px 10px;cursor:pointer;font-size:12.5px;font-weight:600}
 .expandbtn:hover{background:var(--accent-soft)}
 .expandbtn svg{width:13px;height:13px}
-.fsummary{font-size:12px;color:var(--muted);margin:-4px 0 12px;line-height:1.5}
-.tabletoggles{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
-.ttog{position:relative;display:inline-flex;align-items:center;gap:7px;margin:0;padding:5px 10px 5px 9px;border-radius:99px;
+.fsummary{font-size:12.5px;color:var(--muted);margin:0 0 12px;line-height:1.5}
+.tabletoggles{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.ttog{position:relative;display:inline-flex;align-items:center;gap:7px;margin:0;padding:5px 11px 5px 9px;border-radius:99px;
   border:1px solid var(--rule2);font-size:12.5px;font-weight:500;color:var(--muted);cursor:pointer;background:var(--surface);user-select:none}
 .ttog input{position:absolute;opacity:0;pointer-events:none}
-.ttog .sw{width:9px;height:9px;border-radius:2px;background:var(--c);opacity:.35}
-.ttog:has(input:checked){color:var(--ink);border-color:color-mix(in srgb,var(--c) 55%,var(--rule2));
-  background:color-mix(in srgb,var(--c) 9%,var(--surface))}
+.ttog .sw{width:9px;height:9px;border-radius:2px;background:var(--c);opacity:.3}
+.ttog:has(input:checked){color:var(--ink);border-color:color-mix(in srgb,var(--c) 55%,var(--rule2));background:color-mix(in srgb,var(--c) 9%,var(--surface))}
 .ttog:has(input:checked) .sw{opacity:1}
 .ttog:has(input:focus-visible){outline:2px solid var(--accent);outline-offset:2px}
 
-.facet{border:1px solid var(--rule);border-radius:6px;background:var(--glass);margin-top:8px;overflow:hidden}
-.facet-head{display:flex;align-items:center;gap:8px;width:100%;padding:9px 10px 9px 8px;background:none;border:0;
-  cursor:pointer;text-align:left;font-size:13.5px;font-weight:600}
+.facet{border:1px solid var(--rule);border-radius:var(--r-sm);background:var(--surface);margin-top:8px;overflow:hidden}
+.facet-head{display:flex;align-items:center;gap:8px;width:100%;padding:9px 10px 9px 8px;background:none;border:0;cursor:pointer;
+  text-align:left;font-size:13.5px;font-weight:600}
 .facet-head:hover{background:var(--sunk)}
 .caret{width:16px;height:16px;flex-shrink:0;display:inline-grid;place-items:center;color:var(--faint);transition:transform .15s}
-.caret::before{content:'';width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;
-  transform:translate(-1px,-1px) rotate(45deg)}
+.caret::before{content:'';width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:translate(-1px,-1px) rotate(45deg)}
 .closed>.facet-head .caret,.fgroup:not(.open)>.fghead .fcaret{transform:rotate(-90deg)}
 .facet-count{margin-left:auto;font-size:12px;font-weight:500;color:var(--faint);white-space:nowrap}
 .facet-count.some{color:var(--accent);font-weight:600}
@@ -2658,29 +3025,25 @@ input[type=checkbox]{accent-color:var(--accent)}
 .facet-body{border-top:1px solid var(--rule);padding:8px}
 .closed>.facet-body{display:none}
 .facet-tools{display:flex;gap:4px;align-items:center;margin-bottom:6px}
-.facet-tools input{padding:6px 8px;font-size:12.5px}
-.mini{border:1px solid var(--rule2);background:var(--surface);color:var(--muted);border-radius:3px;padding:5px 8px;
-  cursor:pointer;font-size:12px;font-weight:500;white-space:nowrap}
+.facet-tools input{padding:6px 8px;font-size:13px}
+.mini{border:1px solid var(--rule2);background:var(--surface);color:var(--muted);border-radius:5px;padding:5px 9px;cursor:pointer;
+  font-size:12.5px;font-weight:500;white-space:nowrap}
 .mini:hover{color:var(--ink);background:var(--sunk)}
 .flist{max-height:236px;overflow:auto;margin:0 -4px;padding:0 4px;scrollbar-width:thin}
-.fempty{font-size:12.5px;color:var(--faint);padding:8px 4px}
+.fempty{font-size:13px;color:var(--faint);padding:8px 4px}
 
-/* tree, shared by the rail and the pop-out */
 .fgroup{margin:2px 0}
-.fghead{display:flex;align-items:center;gap:4px;padding:3px 2px;border-radius:6px}
+.fghead{display:flex;align-items:center;gap:4px;padding:3px 2px;border-radius:5px}
 .fghead:hover{background:var(--sunk)}
-.fcaret{border:0;background:none;padding:0;cursor:pointer;color:var(--faint);width:18px;height:18px;display:grid;place-items:center;
-  transition:transform .15s;flex-shrink:0}
-.fcaret::before{content:'';width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;
-  transform:translate(-1px,-1px) rotate(45deg)}
+.fcaret{border:0;background:none;padding:0;cursor:pointer;color:var(--faint);width:18px;height:18px;display:grid;place-items:center;transition:transform .15s;flex-shrink:0}
+.fcaret::before{content:'';width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:translate(-1px,-1px) rotate(45deg)}
 .fgcheck{display:flex;align-items:center;gap:7px;margin:0;font-size:13px;font-weight:600;color:var(--ink);cursor:pointer;min-width:0;flex:1}
 .fgcheck input,.fitem input{width:15px;height:15px;margin:0;flex-shrink:0;cursor:pointer}
 .fgname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fgcount{font-size:11.5px;color:var(--faint);font-variant-numeric:tabular-nums;padding-right:4px}
+.fgcount{font-size:11.5px;color:var(--faint);padding-right:4px}
 .fgbody{padding-left:22px}
 .fitems{display:flex;flex-direction:column}
-.fitem{display:flex;align-items:flex-start;gap:7px;margin:0;padding:3px 4px;border-radius:6px;font-size:13px;
-  font-weight:400;color:var(--ink);cursor:pointer;line-height:1.35}
+.fitem{display:flex;align-items:flex-start;gap:7px;margin:0;padding:3px 4px;border-radius:5px;font-size:13px;font-weight:400;color:var(--ink);cursor:pointer;line-height:1.35}
 .fitem:hover{background:var(--sunk)}
 .fitem input{margin-top:1px}
 .fitem .q{background:var(--mark);color:var(--mark-ink);border-radius:2px}
@@ -2689,29 +3052,28 @@ input[type=checkbox]{accent-color:var(--accent)}
 /* =====================================================================
    Filters pop-out
    ===================================================================== */
-dialog.fdlg{padding:0;border:1px solid var(--rule2);border-radius:8px;background:var(--surface);color:var(--ink);
-  width:min(1180px,94vw);height:min(820px,90vh);max-width:none;max-height:none;box-shadow:0 30px 80px -20px rgba(0,0,0,.45);
+dialog.fdlg{padding:0;border:1px solid var(--rule2);border-radius:12px;background:var(--surface);color:var(--ink);
+  width:min(1180px,94vw);height:min(820px,90vh);max-width:none;max-height:none;box-shadow:0 30px 80px -20px rgba(40,20,10,.45);
   display:none;flex-direction:column;overflow:hidden}
 dialog.fdlg[open]{display:flex;animation:pop .18s ease-out}
 dialog.fdlg.max{width:100vw;height:100vh;border-radius:0;border:0}
-dialog.fdlg::backdrop{background:rgba(40,24,14,.35);backdrop-filter:blur(4px)}
+dialog.fdlg::backdrop{background:rgba(40,24,14,.35);backdrop-filter:blur(3px)}
 @keyframes pop{from{opacity:0;transform:scale(.985)}to{opacity:1;transform:none}}
 .fdlg-head{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--rule)}
-.fdlg-head h2{margin:0;font-family:var(--display);font-size:34px;font-weight:400;letter-spacing:-.01em;line-height:1}
-.fdlg-head h2 i{color:var(--accent)}
+.fdlg-head h2{margin:0;font-size:19px;font-weight:700;letter-spacing:-.01em}
 .fdlg-head p{margin:2px 0 0;font-size:13px;color:var(--muted)}
 .fdlg-head .sp{flex:1}
-.fdlg-body{flex:1;min-height:0;display:grid;grid-template-columns:240px minmax(0,1fr)}
+.fdlg-body{flex:1;min-height:0;display:grid;grid-template-columns:250px minmax(0,1fr)}
 .fdlg-nav{border-right:1px solid var(--rule);background:var(--sunk);padding:12px;overflow:auto;display:flex;flex-direction:column;gap:4px}
 .navtab{display:flex;flex-direction:column;align-items:flex-start;gap:1px;width:100%;text-align:left;padding:9px 12px;border:1px solid transparent;
-  border-radius:9px;background:none;cursor:pointer}
+  border-radius:8px;background:none;cursor:pointer}
 .navtab:hover{background:var(--surface)}
 .navtab.on{background:var(--surface);border-color:var(--rule2);box-shadow:inset 3px 0 0 var(--accent)}
 .navtab b{font-size:14px;font-weight:600}
-.navtab span{font-size:12px;color:var(--muted)}
+.navtab span{font-size:12.5px;color:var(--muted)}
 .navtab span.some{color:var(--accent);font-weight:600}
 .navtab span.none{color:var(--bad);font-weight:600}
-.navsep{margin:14px 4px 6px;font-size:12px;font-weight:600;color:var(--muted)}
+.navsep{margin:14px 4px 6px;font-size:12.5px;font-weight:600;color:var(--muted)}
 .fdlg-nav .tabletoggles{flex-direction:column;align-items:stretch;padding:0 2px}
 .fdlg-pane{display:flex;flex-direction:column;min-height:0}
 .fdlg-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 20px 10px}
@@ -2719,59 +3081,56 @@ dialog.fdlg::backdrop{background:rgba(40,24,14,.35);backdrop-filter:blur(4px)}
 .fdlg-tools .checkline{margin:0 0 0 4px;white-space:nowrap}
 .presets{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:0 20px 10px;font-size:12.5px;color:var(--muted)}
 .presets:empty{display:none}
-.preset{border:1px dashed var(--rule2);background:var(--surface);color:var(--ink);border-radius:99px;padding:4px 11px;cursor:pointer;
-  font-size:12.5px}
+.preset{border:1px dashed var(--rule2);background:var(--surface);color:var(--ink);border-radius:99px;padding:4px 11px;cursor:pointer;font-size:12.5px}
 .preset:hover{border-style:solid;border-color:var(--accent);color:var(--accent)}
 .preset small{color:var(--faint);margin-left:3px}
 .fdlg-list{flex:1;min-height:0;overflow:auto;padding:4px 20px 20px;border-top:1px solid var(--rule)}
 .fdlg-list>.fgroup{padding:10px 0;margin:0;border-bottom:1px solid var(--rule)}
 .fdlg-list>.fgroup:last-child{border-bottom:0}
-.fdlg-list>.fgroup>.fghead{padding:4px 2px}
 .fdlg-list>.fgroup>.fghead .fgcheck{font-size:14.5px}
-.fdlg-list .fgroup .fgroup{break-inside:avoid}
-.fdlg-list .fitems{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:0 12px}
+.fdlg-list .fitems{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:0 12px}
 .fdlg-list .fgbody{padding-left:24px}
-.fdlg-list .fgbody:has(>.fgroup){display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:4px 18px;padding-top:4px}
+.fdlg-list .fgbody:has(>.fgroup){display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:4px 18px;padding-top:4px}
 .fdlg-list .fgbody>.fgroup .fitems{grid-template-columns:1fr}
 .fdlg-list>.fitems{padding-top:10px}
 .fdlg-foot{display:flex;align-items:center;gap:12px;padding:14px 20px;border-top:1px solid var(--rule);background:var(--sunk)}
-.fdlg-foot .note{font-size:12.5px;color:var(--muted);flex:1}
+.fdlg-foot .note{font-size:13px;color:var(--muted);flex:1}
 
 /* =====================================================================
    Composer
    ===================================================================== */
-.composer{background:var(--glass);border:1px solid var(--glass-edge);outline:1px solid var(--rule);border-radius:8px;box-shadow:var(--lift);
-  padding:24px 26px 22px;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
-.ctitle{font-family:var(--display);font-weight:400;font-size:44px;line-height:1;letter-spacing:-.015em;margin:8px 0 18px}
-.ctitle i{color:var(--accent)}
-.chead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:8px}
-.chead label{margin:0;font-size:14px;color:var(--ink)}
+.composer{background:var(--surface);border:1px solid var(--rule);border-radius:var(--r-md);box-shadow:var(--shadow);padding:22px 24px 20px}
+.ctitle{font-size:24px;font-weight:700;letter-spacing:-.015em;line-height:1.2;margin:0 0 4px}
+.csub{font-size:14px;color:var(--muted);margin:0 0 18px;max-width:78ch}
+.chead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:7px}
+.chead label{margin:0}
 .termcount{font-size:12.5px;font-weight:600;color:var(--accent)}
 .chead .hint{margin:0 0 0 auto}
-textarea#terms{height:164px;resize:vertical;font-family:var(--mono);font-size:13px;line-height:1.6;background:var(--sunk)}
-.syntax{margin-top:8px;font-size:12.5px;color:var(--muted)}
+textarea#terms{height:150px;resize:vertical;font-family:var(--mono);font-size:13.5px;line-height:1.6;background:var(--sunk)}
+.syntax{margin-top:8px;font-size:13px;color:var(--muted)}
 .syntax summary{cursor:pointer;color:var(--accent);font-weight:600;width:max-content}
-.syntax table{border-collapse:collapse;margin-top:8px;width:100%;max-width:760px}
-.syntax td{padding:5px 10px 5px 0;border-top:1px solid var(--rule);vertical-align:top}
+.syntax table{border-collapse:collapse;margin-top:8px;width:100%;max-width:780px}
+.syntax td{padding:6px 12px 6px 0;border-top:1px solid var(--rule);vertical-align:top}
 .syntax td:first-child{white-space:nowrap;width:1%}
-.optrow{display:grid;grid-template-columns:minmax(0,420px) minmax(0,1fr);gap:8px 28px;margin-top:14px;align-items:start}
+.optrow{display:grid;grid-template-columns:minmax(0,420px) minmax(0,1fr);gap:8px 28px;margin-top:12px;align-items:start}
 .optrow label{margin-top:0}
-#thresholdWrap{display:none;margin-top:10px;padding:10px 12px;background:var(--sunk);border-radius:9px;border:1px solid var(--rule)}
-.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;align-items:center}
-.actions .btn.primary{padding:10px 26px}
+#thresholdWrap{display:none;margin-top:10px;padding:10px 12px;background:var(--sunk);border-radius:var(--r-sm);border:1px solid var(--rule)}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px;align-items:center}
+.actions .btn.primary{padding:10px 28px}
 .progwrap{display:none;margin-top:12px}
 .progbar{height:6px;border-radius:99px;background:var(--sunk);border:1px solid var(--rule);overflow:hidden}
 .progfill{height:100%;width:0;background:var(--accent);transition:width .35s}
-.progtxt{font-size:12.5px;color:var(--muted);margin-top:5px}
-.exportbox{margin-top:18px;padding-top:16px;border-top:1px solid var(--rule)}
-.exportbox h3{margin:0 0 6px}
+.progtxt{font-size:13px;color:var(--muted);margin-top:5px}
+.exportbox{margin-top:20px;padding-top:18px;border-top:1px solid var(--rule)}
+.exportbox .ptitle{margin-bottom:2px}
 .exgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 20px}
 .exportrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
-.exportrow select{width:auto;padding:7px 8px;font-size:13px}
+.exportrow select{width:auto;padding:8px 10px;font-size:13.5px}
+.exportnote{font-size:12.5px;color:var(--faint);margin-top:8px}
 
 #interp{margin-top:14px;display:none}
-.itable{width:100%;border-collapse:separate;border-spacing:0;font-size:13px;border:1px solid var(--rule);border-radius:10px;overflow:hidden}
-.itable th{background:var(--sunk);text-align:left;padding:8px 10px;font-size:12px;color:var(--muted);font-weight:600}
+.itable{width:100%;border-collapse:separate;border-spacing:0;font-size:13px;border:1px solid var(--rule);border-radius:var(--r-sm);overflow:hidden}
+.itable th{background:var(--sunk);text-align:left;padding:8px 10px;font-size:12.5px;color:var(--muted);font-weight:600}
 .itable td{padding:9px 10px;border-top:1px solid var(--rule);vertical-align:top}
 .iwarn{color:var(--warn);font-weight:600}
 .inote{color:var(--muted)}
@@ -2780,39 +3139,37 @@ textarea#terms{height:164px;resize:vertical;font-family:var(--mono);font-size:13
 /* =====================================================================
    Results
    ===================================================================== */
-#results{margin-top:22px}
-.welcome{padding:56px 24px;text-align:center;color:var(--muted);border:1px dashed var(--rule2);border-radius:8px}
-.welcome h2{font-family:var(--display);font-weight:400;font-size:32px;color:var(--ink);margin:0 0 10px;letter-spacing:-.01em}
-.welcome h2 i{color:var(--accent)}
-.welcome p{margin:0 auto;max-width:56ch}
-.roundnote,.dropnote{padding:10px 14px;margin-bottom:14px;border-radius:10px;font-size:13px;line-height:1.6}
-.roundnote{background:var(--glass);border:1px solid var(--rule);color:var(--muted)}
+.welcome{padding:48px 24px;text-align:center;color:var(--muted);border:1px dashed var(--rule2);border-radius:var(--r-md);background:color-mix(in srgb,var(--surface) 50%,transparent)}
+.welcome h2{font-weight:700;font-size:19px;color:var(--ink);margin:0 0 8px;letter-spacing:-.01em}
+.welcome p{margin:0 auto;max-width:60ch}
+.welcome ol{display:inline-flex;gap:22px;flex-wrap:wrap;justify-content:center;list-style:none;padding:0;margin:18px 0 0;font-size:13.5px;color:var(--ink)}
+.welcome li{display:flex;align-items:center;gap:8px}
+.roundnote,.dropnote{padding:10px 14px;border-radius:var(--r-sm);font-size:13px;line-height:1.6}
+.roundnote{background:var(--surface);border:1px solid var(--rule);color:var(--muted);margin-bottom:14px}
 .roundnote b{color:var(--ink)}
-.dropnote{display:none;background:var(--warn-soft);color:var(--warn);font-weight:600}
+.dropnote{display:none;background:var(--warn-soft);color:var(--warn);font-weight:600;margin-bottom:14px}
 
-.termcard{background:var(--glass);border:1px solid var(--glass-edge);outline:1px solid var(--rule);border-radius:8px;box-shadow:var(--lift);
-  margin-bottom:24px;overflow:hidden;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
-.termhead{display:flex;align-items:center;gap:10px 14px;padding:16px 20px;cursor:pointer;flex-wrap:wrap}
-.termhead:hover{background:color-mix(in srgb,var(--sunk) 70%,transparent)}
+.termcard{background:var(--surface);border:1px solid var(--rule);border-radius:var(--r-md);box-shadow:var(--shadow);margin-bottom:20px;overflow:hidden}
+.termhead{display:flex;align-items:center;gap:10px 14px;padding:16px 20px;cursor:pointer;flex-wrap:wrap;border-top:3px solid var(--accent)}
+.termhead:hover{background:color-mix(in srgb,var(--sunk) 60%,transparent)}
 .termhead .arrow{width:16px;height:16px;display:grid;place-items:center;color:var(--faint);transition:transform .15s;flex-shrink:0}
-.termhead .arrow::before{content:'';width:7px;height:7px;border-right:1.8px solid currentColor;border-bottom:1.8px solid currentColor;
-  transform:translate(-1px,-2px) rotate(45deg)}
+.termhead .arrow::before{content:'';width:7px;height:7px;border-right:1.8px solid currentColor;border-bottom:1.8px solid currentColor;transform:translate(-1px,-2px) rotate(45deg)}
 .termhead.closed .arrow{transform:rotate(-90deg)}
-.termname{font-family:var(--display);font-style:italic;font-size:36px;font-weight:400;letter-spacing:-.01em;line-height:1.05;color:var(--accent)}
-.hitpill{padding:3px 11px;border-radius:99px;background:var(--ink);color:var(--surface);font-weight:600;font-size:12.5px;font-variant-numeric:tabular-nums}
+.termname{font-size:20px;font-weight:700;letter-spacing:-.01em;line-height:1.2}
+.hitpill{padding:3px 11px;border-radius:99px;background:var(--accent);color:var(--on-accent);font-weight:600;font-size:12.5px}
 .hitpill.zero{background:var(--na-soft);color:var(--na)}
 .rpill{padding:2px 9px;border-radius:99px;font-weight:600;font-size:12px}
 .rpill.r4{background:var(--r4-soft);color:var(--r4)}
 .rpill.r5{background:var(--r5-soft);color:var(--r5)}
 .aliaswrap{display:inline-flex;gap:5px;flex-wrap:wrap;align-items:center;font-size:12.5px;color:var(--faint)}
 .alias{padding:2px 9px;border-radius:99px;background:var(--accent-soft);color:var(--accent);font-size:12px;font-weight:500}
-.scopetag{padding:2px 9px;border-radius:99px;background:var(--r5-soft);color:var(--r5);font-size:12px;font-weight:600}
+.scopetag{padding:2px 9px;border-radius:99px;background:var(--warn-soft);color:var(--warn);font-size:12px;font-weight:600}
 
 .covs{margin-left:auto;display:flex;gap:20px;flex-wrap:wrap;flex:0 1 560px;justify-content:flex-end}
 .cov{min-width:210px;flex:1 1 230px}
 .covtop{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:5px}
-.covlabel{font-size:12px;font-weight:500;color:var(--muted)}
-.covnum{font-weight:700;font-size:15px;color:var(--accent);font-variant-numeric:tabular-nums}
+.covlabel{font-size:12.5px;font-weight:500;color:var(--muted)}
+.covnum{font-weight:700;font-size:15px;color:var(--accent)}
 .covnum small{font-size:12px;color:var(--muted);font-weight:500}
 .covnum.r4{color:var(--r4)} .covnum.r5{color:var(--r5)}
 .covtrack{height:6px;border-radius:99px;background:var(--sunk);overflow:hidden;box-shadow:inset 0 0 0 1px var(--rule)}
@@ -2820,17 +3177,17 @@ textarea#terms{height:164px;resize:vertical;font-family:var(--mono);font-size:13
 .covfill.r4{background:var(--r4)} .covfill.r5{background:var(--r5)}
 .covcountries{font-size:12.5px}
 
-.warnbar{padding:9px 20px;background:var(--warn-soft);color:var(--warn);font-size:12.5px;font-weight:500;line-height:1.55;border-top:1px solid var(--rule)}
+.warnbar{padding:9px 20px;background:var(--warn-soft);color:var(--warn);font-size:13px;font-weight:500;line-height:1.55;border-top:1px solid var(--rule)}
 .warnbar div+div{margin-top:3px}
 .formsbar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:10px 20px;border-top:1px solid var(--rule);background:var(--sunk)}
 .formsbar .lbl{font-size:12.5px;color:var(--muted);margin-right:4px}
 .form{padding:1px 8px;border-radius:5px;background:var(--surface);border:1px solid var(--rule2);font-size:12.5px;font-weight:600}
-.form i{font-style:normal;font-weight:500;color:var(--faint);margin-left:5px;font-variant-numeric:tabular-nums}
+.form i{font-style:normal;font-weight:500;color:var(--faint);margin-left:5px}
 .chipbox{display:none;padding:14px 20px;background:var(--sunk);border-top:1px solid var(--rule);flex-direction:column;gap:10px}
 .chipbox.open{display:flex}
 .chiprow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .chip{padding:3px 10px;border-radius:99px;background:var(--surface);border:1px solid var(--rule2);font-size:12.5px}
-.chip b{color:var(--accent);font-variant-numeric:tabular-nums}
+.chip b{color:var(--accent)}
 .cmpt{border-collapse:collapse;font-size:12.5px;margin-top:2px}
 .cmpt td,.cmpt th{padding:4px 12px 4px 0;border-bottom:1px solid var(--rule);text-align:left}
 .cmpt th{font-size:12px;color:var(--muted);font-weight:600}
@@ -2841,34 +3198,36 @@ textarea#terms{height:164px;resize:vertical;font-family:var(--mono);font-size:13
 .pat.none{background:var(--na-soft);color:var(--na)}
 
 .termbody{padding:4px 20px 20px;border-top:1px solid var(--rule)}
-.cardtools{display:flex;align-items:center;gap:10px;padding:14px 0 0;flex-wrap:wrap;font-size:12.5px;color:var(--muted)}
+.cardtools{display:flex;align-items:center;gap:10px;padding:14px 0 0;flex-wrap:wrap;font-size:13px;color:var(--muted)}
 .tblsec{margin-top:18px}
 .secbar{display:flex;align-items:center;gap:10px;margin-bottom:8px}
 .secbar .bar{width:10px;height:10px;border-radius:3px}
-.secbar .name{font-family:var(--display);font-size:21px;font-weight:400}
-.secbar .cnt{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.secbar .name{font-weight:650;font-size:15px}
+.secbar .cnt{font-size:13px;color:var(--muted)}
+.secrows{overflow-x:auto}
 
-table.results{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--rule);border-radius:6px;background:var(--surface);
-  overflow:hidden;font-size:13px;table-layout:fixed}
-table.results th{background:var(--sunk);text-align:left;padding:8px 10px;border-bottom:1px solid var(--rule);
-  font-size:12px;color:var(--muted);font-weight:600}
-table.results td{padding:10px;border-bottom:1px solid var(--rule);vertical-align:top;overflow-wrap:anywhere}
+table.results{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--rule);border-radius:var(--r-sm);overflow:hidden;
+  font-size:13.5px;table-layout:fixed;background:var(--surface)}
+table.results th{position:relative;background:var(--sunk);text-align:left;padding:8px 10px;border-bottom:1px solid var(--rule);font-size:12.5px;color:var(--muted);font-weight:600}
+table.results td{padding:11px 10px;border-bottom:1px solid var(--rule);vertical-align:top;overflow-wrap:anywhere}
 table.results tbody tr:last-child td{border-bottom:0}
-table.results tbody tr.hit:hover td{background:color-mix(in srgb,var(--accent-soft) 40%,transparent)}
+table.results tbody tr.hit:hover td{background:color-mix(in srgb,var(--accent-soft) 35%,transparent)}
 td.jur{font-weight:600}
-td.meas{font-variant-numeric:tabular-nums;color:var(--muted)}
-td.ctx{font-family:var(--serif);font-size:14px;line-height:1.6}
+td.meas{color:var(--muted)}
+td.ctx{line-height:1.6}
+.smallmeta{display:block;font-size:12.5px;color:var(--muted);font-weight:400;margin-top:2px}
 tr.dropped td{opacity:.35}
 tr.dropped td.ctx{text-decoration:line-through}
 tr.dropped td.acts{opacity:1}
-.rowtools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;font-family:var(--sans);font-size:12.5px}
-.readbtn{display:inline-flex;align-items:center;gap:5px;border:1px solid color-mix(in srgb,var(--accent) 45%,var(--rule2));background:transparent;
-  color:var(--accent);border-radius:3px;padding:3px 9px;cursor:pointer;font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase}
+.rowtools{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:7px;font-size:12.5px}
+.readbtn{display:inline-flex;align-items:center;gap:5px;border:1px solid color-mix(in srgb,var(--accent) 45%,var(--rule2));background:var(--surface);color:var(--accent);
+  border-radius:5px;padding:3px 10px;cursor:pointer;font-size:12.5px;font-weight:600}
 .readbtn:hover{background:var(--accent-soft)}
 .readbtn[aria-expanded=true]{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
-.fmt{font-size:11.5px;color:var(--muted);border:1px solid var(--rule);border-radius:5px;padding:0 6px;background:var(--sunk)}
+.fmt{font-size:12px;color:var(--muted);border:1px solid var(--rule);border-radius:5px;padding:0 6px;background:var(--sunk)}
+.parttag{font-size:12px;color:var(--accent);background:var(--accent-soft);border-radius:5px;padding:0 7px;font-weight:600}
 .acts{white-space:nowrap;text-align:right}
-.actbtn,.exbtn{border:0;background:transparent;color:var(--faint);cursor:pointer;font-size:14px;line-height:1;padding:4px 6px;border-radius:6px}
+.actbtn,.exbtn{border:0;background:transparent;color:var(--faint);cursor:pointer;font-size:14px;line-height:1;padding:4px 6px;border-radius:5px}
 .actbtn:hover{background:var(--accent-soft);color:var(--accent)}
 .exbtn:hover{background:var(--bad-soft);color:var(--bad)}
 .actbtn.done{color:var(--good)}
@@ -2880,64 +3239,83 @@ tr.dropped .exbtn{color:var(--good)}
 .pill.warn{background:var(--warn-soft);color:var(--warn)}
 .pill.bad{background:var(--bad-soft);color:var(--bad)}
 .pill.na{background:var(--na-soft);color:var(--na)}
-.rtag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:11.5px;font-weight:700;white-space:nowrap}
+.rtag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:12px;font-weight:700;white-space:nowrap}
 .rtag.r4{background:var(--r4-soft);color:var(--r4)}
 .rtag.r5{background:var(--r5-soft);color:var(--r5)}
 
-/* ---------- the rendered paragraph ---------- */
+/* ---------- the rendered paragraph / KID ---------- */
 tr.docrow>td{padding:0 10px 14px;background:var(--sunk)}
-.doc{background:var(--doc);border:1px solid var(--rule);border-left:3px solid var(--c,var(--accent));border-radius:2px 6px 6px 2px;
-  padding:16px 22px 18px;margin-top:2px;box-shadow:var(--lift)}
-.dochead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:12.5px;color:var(--muted);
-  padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid var(--rule)}
+.doc{background:var(--doc);border:1px solid var(--rule);border-left:3px solid var(--c,var(--accent));border-radius:4px var(--r-sm) var(--r-sm) 4px;
+  padding:16px 22px 18px;margin-top:2px;box-shadow:var(--shadow)}
+.dochead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:13px;color:var(--muted);padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid var(--rule)}
 .dochead .cite{font-weight:600;color:var(--ink)}
 .dochead .sp{flex:1}
-.docbody{font-family:var(--serif);font-size:15.5px;line-height:1.7;color:var(--ink);max-width:88ch}
+.docbody{font-size:15px;line-height:1.7;color:var(--ink);max-width:92ch}
 .docbody>*:first-child{margin-top:0}
 .docbody>*:last-child{margin-bottom:0}
-.docbody p{margin:0 0 .75em}
-.docbody ul,.docbody ol{margin:0 0 .75em;padding-left:1.5em}
+.docbody p{margin:0 0 .7em}
+.docbody ul,.docbody ol{margin:0 0 .7em;padding-left:1.5em}
 .docbody li{margin:.2em 0}
 .docbody li::marker{color:var(--faint)}
-.docbody h4,.docbody h5,.docbody h6{font-family:var(--sans);margin:1em 0 .4em;font-size:15px}
+.docbody h4,.docbody h5,.docbody h6{margin:1em 0 .4em;font-size:15px}
 .docbody sup,.docbody sub{font-size:.7em;line-height:0}
 .docbody sup{color:var(--accent)}
-.docbody a{color:var(--accent)}
-.docbody blockquote{margin:0 0 .75em;padding-left:14px;border-left:3px solid var(--rule2);color:var(--muted)}
+.docbody a{color:var(--accent);overflow-wrap:anywhere}
+.docbody blockquote{margin:0 0 .7em;padding-left:14px;border-left:3px solid var(--rule2);color:var(--muted)}
 .docbody hr{border:0;border-top:1px solid var(--rule);margin:1em 0}
 .docbody .tblwrap{overflow-x:auto;margin:.4em 0 1em;max-width:100%}
-.docbody table{border-collapse:collapse;font-family:var(--sans);font-size:13px;line-height:1.45;min-width:50%;
-  background:var(--surface);border:1px solid var(--rule2)}
+.docbody table{border-collapse:collapse;font-size:13.5px;line-height:1.45;min-width:50%;background:var(--surface);border:1px solid var(--rule2)}
 .docbody th,.docbody td{border:1px solid var(--rule2);padding:6px 10px;vertical-align:top;text-align:left}
 .docbody thead th,.docbody thead td,.docbody tr:first-child>th{background:var(--sunk);font-weight:600}
 .docbody td p,.docbody th p{margin:0 0 .4em}
 .docbody td p:last-child,.docbody th p:last-child{margin-bottom:0}
-/* FATF report boxes: case studies, examples */
 .docbody .mbox,.docbody .boxed,.docbody div.shaded{display:block;background:var(--box);border:0;border-left:3px solid var(--box-rule);
-  border-radius:2px 6px 6px 2px;padding:14px 18px;margin:.6em 0 1em;font-size:14.5px}
+  border-radius:2px var(--r-sm) var(--r-sm) 2px;padding:14px 18px;margin:.6em 0 1em;font-size:14.5px}
 .docbody table.mbox{display:table;width:100%;border-collapse:separate}
-.docbody table.mbox>*>tr>td,.docbody table.mbox>tr>td{border:0;padding:0;background:transparent;font-family:var(--serif);
-  font-size:14.5px;line-height:1.65}
-.docbody .mbox .boxtitle{font-family:var(--sans);font-weight:700;font-size:13.5px;color:var(--accent-strong);margin-bottom:.5em}
+.docbody table.mbox>*>tr>td,.docbody table.mbox>tr>td{border:0;padding:0;background:transparent;font-size:14.5px;line-height:1.65}
+.docbody .mbox .boxtitle{font-weight:700;font-size:14px;color:var(--accent-strong);margin-bottom:.5em}
 body.dark .docbody .mbox .boxtitle{color:var(--accent)}
 .docbody td.shaded,.docbody th.shaded,.docbody tr.shaded>td{background:var(--box)}
-.docbody .tblcap{font-family:var(--sans);font-size:13px;font-weight:600}
+.docbody .tblcap{font-size:13.5px;font-weight:600}
+
+/* KID record: details, then the five steps in order */
+.kidtop{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap;padding-bottom:12px;margin-bottom:14px;border-bottom:1px solid var(--rule)}
+.kidtitle{font-size:17px;font-weight:700;letter-spacing:-.01em}
+.kidtitle small{font-weight:500;color:var(--muted);font-size:13.5px;margin-left:6px}
+.kidmeta{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px 22px;width:100%;margin-top:4px}
+.kidmeta div{font-size:13.5px}
+.kidmeta dt{font-size:12px;color:var(--muted);margin:0 0 1px}
+.kidmeta dd{margin:0;font-weight:600}
+.kidtop .sp{flex:1}
+ol.steps{list-style:none;margin:0;padding:0;position:relative;max-width:96ch}
+ol.steps::before{content:'';position:absolute;left:13px;top:12px;bottom:12px;width:2px;background:var(--rule)}
+ol.steps>li{position:relative;padding:0 0 16px 44px}
+ol.steps>li:last-child{padding-bottom:0}
+.stepdot{position:absolute;left:0;top:0;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;font-size:12.5px;font-weight:700;
+  background:var(--surface);border:2px solid var(--rule2);color:var(--muted)}
+li.hit .stepdot{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.steplabel{font-size:13.5px;font-weight:700;margin:3px 0 6px;display:flex;align-items:center;gap:8px}
+.steplabel .found{font-size:11.5px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:99px;padding:0 8px}
+li.hit .stepbody{background:color-mix(in srgb,var(--accent-soft) 45%,var(--surface));border:1px solid color-mix(in srgb,var(--accent) 25%,var(--rule));border-radius:var(--r-sm);padding:10px 14px}
+.stepbody.emptypart{color:var(--faint);font-size:13.5px;font-style:normal}
+.decision{display:inline-block;white-space:nowrap;padding:1px 9px;border-radius:99px;font-size:12px;font-weight:700}
+.decision.up{background:var(--good-soft);color:var(--good)}
+.decision.down{background:var(--bad-soft);color:var(--bad)}
+.decision.same{background:var(--na-soft);color:var(--na)}
 
 .morebar{display:flex;gap:8px;margin-top:8px}
-.morebtn{flex:1;padding:8px;border:1px dashed var(--rule2);background:transparent;color:var(--accent);border-radius:4px;cursor:pointer;
-  font-weight:600;font-size:13px}
+.morebtn{flex:1;padding:8px;border:1px dashed var(--rule2);background:var(--surface);color:var(--accent);border-radius:var(--r-sm);cursor:pointer;font-weight:600;font-size:13px}
 .morebtn:hover{border-style:solid;background:var(--accent-soft)}
 .morebtn.all{flex:0 0 auto;padding:8px 16px}
 .empty{color:var(--faint);font-size:13px;padding:10px 2px}
 
 .hist{display:flex;flex-direction:column}
-.hist a{display:block;color:var(--ink);cursor:pointer;padding:7px 4px;text-decoration:none;font-size:13px;border-bottom:1px solid var(--rule);
+.hist a{display:block;color:var(--ink);cursor:pointer;padding:7px 6px;text-decoration:none;font-size:13px;border-bottom:1px solid var(--rule);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:4px}
 .hist a:last-child{border-bottom:0}
-.hist a:hover{color:var(--accent);background:var(--surface)}
+.hist a:hover{color:var(--accent);background:var(--sunk)}
 .hist a small{color:var(--faint);margin-right:6px}
 
-.secrows{overflow-x:auto}
 @media (max-width:1080px){
   .layout{grid-template-columns:minmax(0,1fr);padding:16px}
   .rail{position:static;max-height:none;overflow:visible}
@@ -2953,12 +3331,13 @@ body.dark .docbody .mbox .boxtitle{color:var(--accent)}
   .brandsub,.srcchip{display:none!important}
   .composer{padding:16px}
   .seg button{white-space:normal;line-height:1.25}
-  table.results{min-width:680px}
+  table.results{min-width:700px}
   .chead .hint{margin-left:0}
   .termhead{padding:14px 16px}
   .termbody{padding:4px 12px 16px}
   .fdlg-foot{flex-wrap:wrap}
   .fdlg-foot .note{display:none}
+  .doc{padding:14px}
 }
 </style>
 </head>
@@ -2967,8 +3346,8 @@ body.dark .docbody .mbox .boxtitle{color:var(--accent)}
   <div class="brand">
     <span class="brandmark" aria-hidden="true"></span>
     <div>
-      <div class="brandname">MER <i>Search</i></div>
-      <div class="brandsub">FATF mutual evaluation reports, __VERSION__</div>
+      <div class="brandname">FATF Search Tool</div>
+      <div class="brandsub">Mutual evaluations and key issues, __VERSION__</div>
     </div>
   </div>
   <span class="grow"></span>
@@ -2981,12 +3360,17 @@ body.dark .docbody .mbox .boxtitle{color:var(--accent)}
   <!-- ======================= RAIL ======================= -->
   <aside class="rail" aria-label="Source and filters">
     <section class="panel">
-      <h2 class="ptitle">Source</h2>
-      <div class="seg" id="modeSeg">
-        <button class="on" data-v="MER" onclick="setMode('MER')">Mutual evaluations</button>
-        <button data-v="OTHER" onclick="setMode('OTHER')">Other files</button>
+      <h2 class="ptitle"><span class="step">1</span>Choose what to search</h2>
+      <div class="srcpick" id="modeSeg" role="radiogroup" aria-label="Source">
+        <button class="srcopt on" data-v="MER" role="radio" onclick="setMode('MER')"><span class="radio"></span>
+          <span><b>Mutual evaluations</b><span class="d">Every paragraph of the MERs: effectiveness, risk and context, technical compliance</span></span></button>
+        <button class="srcopt" data-v="KID" role="radio" onclick="setMode('KID')"><span class="radio"></span>
+          <span><b>Key issues</b><span class="d">Key Issue Documents: what was debated at Plenary and what was decided</span></span></button>
+        <button class="srcopt" data-v="OTHER" role="radio" onclick="setMode('OTHER')"><span class="radio"></span>
+          <span><b>Other files</b><span class="d">Your own Word, PDF, Excel, CSV and text files</span></span></button>
       </div>
-      <div id="roundWrap" style="margin-top:8px">
+      <div id="roundWrap">
+        <div class="sublabel">Round</div>
         <div class="seg" id="roundSeg">
           <button data-v="4" onclick="setRound('4')">4th round</button>
           <button class="on" data-v="5" onclick="setRound('5')">5th round</button>
@@ -2999,6 +3383,7 @@ body.dark .docbody .mbox .boxtitle{color:var(--accent)}
         <div id="pathFields" style="display:none">
           <label for="p4">4th round folder</label><input type="text" id="p4" placeholder="Leave blank for the default">
           <label for="p5">5th round folder</label><input type="text" id="p5" placeholder="Leave blank for the default">
+          <label for="pk">Key Issue Documents folder</label><input type="text" id="pk" placeholder="Leave blank for the default">
           <label for="po">Other files folder</label><input type="text" id="po" placeholder="Leave blank for the default">
           <div class="hint">Paste the full folder path, e.g. C:\Users\you\Documents\MER data\round_4. The tool remembers it on this computer. Changes take effect when you load the data.</div>
         </div>
@@ -3009,18 +3394,14 @@ body.dark .docbody .mbox .boxtitle{color:var(--accent)}
 
     <section class="panel" id="filterCard">
       <div class="ftop">
-        <h2 class="ptitle">Filters</h2>
+        <h2 class="ptitle"><span class="step">2</span>Narrow it down <span class="sub" style="margin-left:4px">optional</span></h2>
         <button class="expandbtn" onclick="openFilters()" title="Open the filters in a large window">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M9.5 2.5h4v4M13.5 2.5 9 7M6.5 13.5h-4v-4M2.5 13.5 7 9"/></svg>
           Expand
         </button>
       </div>
       <div class="fsummary" id="fSummary">Searching everything in the loaded reports.</div>
-      <div class="tabletoggles" id="tableToggles">
-        <label class="ttog" style="--c:var(--eff)"><input type="checkbox" id="tEff" checked onchange="syncTables(this)"><span class="sw"></span>Effectiveness</label>
-        <label class="ttog" style="--c:var(--rc)"><input type="checkbox" id="tRC" checked onchange="syncTables(this)"><span class="sw"></span>Risk and context</label>
-        <label class="ttog" style="--c:var(--tc)"><input type="checkbox" id="tTC" checked onchange="syncTables(this)"><span class="sw"></span>Technical compliance</label>
-      </div>
+      <div class="tabletoggles" id="tableToggles"></div>
       <div id="facetRail"></div>
       <button class="btn grey wide" style="margin-top:12px" onclick="clearFilters()">Reset filters</button>
     </section>
@@ -3034,10 +3415,10 @@ body.dark .docbody .mbox .boxtitle{color:var(--accent)}
   <!-- ======================= MAIN ======================= -->
   <main class="main">
     <section class="composer">
-      <div class="eyebrow">FATF mutual evaluation reports</div>
-      <h1 class="ctitle">Search the <i>evaluations</i></h1>
+      <h1 class="ptitle" style="font-size:16px"><span class="step">3</span>Type your search terms</h1>
+      <p class="csub" id="modeIntro"></p>
       <div class="chead">
-        <label for="terms">Search terms, one per line</label>
+        <label for="terms">One term per line</label>
         <span class="termcount" id="termCount">0 terms</span>
         <span class="hint"><span class="kbd">Ctrl</span> + <span class="kbd">Enter</span> to search</span>
       </div>
@@ -3088,7 +3469,8 @@ body.dark .docbody .mbox .boxtitle{color:var(--accent)}
       <div id="interp"></div>
 
       <div class="exportbox">
-        <h3 class="eyebrow">Export</h3>
+        <h3 class="ptitle"><span class="step">4</span>Export the results</h3>
+        <div class="exportnote">Removed hits (✕) are left out. Each quote comes with its citation.</div>
         <div class="exgrid">
           <div>
             <label for="reportName">Report name <span class="opt">(title and file name; blank uses the first term)</span></label>
@@ -3101,12 +3483,12 @@ body.dark .docbody .mbox .boxtitle{color:var(--accent)}
         </div>
         <div class="hint" id="fileNamePreview"></div>
         <div class="exportrow">
-          <button class="btn ghost" id="btnExportX" onclick="doExport('xlsx')" disabled>Export Excel</button>
-          <button class="btn ghost" id="btnExportW" onclick="doExport('docx')" disabled>Export Word report</button>
-          <button class="btn ghost" id="btnExportB" onclick="doExport('both')" disabled>Export both</button>
+          <button class="btn ghost" id="btnExportX" onclick="doExport('xlsx')" disabled>Excel workbook</button>
+          <button class="btn ghost" id="btnExportW" onclick="doExport('docx')" disabled>Word report</button>
+          <button class="btn ghost" id="btnExportB" onclick="doExport('both')" disabled>Both</button>
           <select id="quoteStyle" title="How quotes appear in the Excel and Word exports" aria-label="Quote style in exports">
-            <option value="paragraph">Quotes: full paragraph</option>
-            <option value="sentence">Quotes: sentence only (much smaller files)</option>
+            <option value="paragraph" id="qsFull">Quotes: full paragraph</option>
+            <option value="sentence">Quotes: sentence with the term only (smaller files)</option>
           </select>
         </div>
       </div>
@@ -3120,7 +3502,7 @@ body.dark .docbody .mbox .boxtitle{color:var(--accent)}
 <dialog class="fdlg" id="fdlg" aria-labelledby="fdlgTitle">
   <div class="fdlg-head">
     <div>
-      <h2 id="fdlgTitle">Choose <i>what to search</i></h2>
+      <h2 id="fdlgTitle">Filters</h2>
       <p id="dlgSummary"></p>
     </div>
     <span class="sp"></span>
@@ -3161,9 +3543,14 @@ let cards={};
 const RLAB={'4':'4th round','5':'5th round','both':'4th and 5th rounds'};
 const RCLS={'4th round':'r4','5th round':'r5'};
 const RSHORT={'4th round':'4th','5th round':'5th'};
-const WELCOME='<div class="welcome"><h2>Every hit, <i>in context</i></h2>'
-  +'<p>Load a source on the left, type your terms and search. Each term gets its own card with jurisdiction coverage, '
-  +'and every hit opens to the paragraph as it appears in the report, tables and boxes included.</p></div>';
+const INTRO={
+  MER:'Searches every paragraph of the mutual evaluation reports. Each hit opens to the paragraph as it appears in the report, tables and boxes included.',
+  KID:'Searches the Key Issue Documents: the key issue, the ECG discussion and proposal, and the Plenary discussion and decision. Each hit is one KID, and opens to the full record.',
+  OTHER:'Searches your own files in the "other" folder, and shows exactly where each hit is.'};
+function welcomeHtml(){
+  return '<div class="welcome"><h2>Your results will appear here</h2><p>'+INTRO[dataMode]+'</p>'
+    +'<ol><li><span class="step">1</span>Choose a source</li><li><span class="step">2</span>Narrow it down if you like</li>'
+    +'<li><span class="step">3</span>Type terms and search</li><li><span class="step">4</span>Export</li></ol></div>';}
 
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -3183,13 +3570,21 @@ function fileNamePreview(){
 function togglePaths(){const f=$('pathFields');f.style.display=(f.style.display==='none'?'block':'none');}
 
 function segSet(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));}
-function setMode(v){if(v===dataMode)return;dataMode=v;segSet('modeSeg',v);
-  $('roundWrap').style.display=(v==='MER')?'':'none';
-  $('filterCard').style.display=(v==='MER')?'':'none';
-  loaded=false;setChip(null);loadData();}
+function applyModeUI(){
+  segSet('modeSeg',dataMode);
+  document.querySelectorAll('#modeSeg button').forEach(b=>b.setAttribute('aria-checked',b.dataset.v===dataMode));
+  const st=dataMode!=='OTHER';
+  $('roundWrap').style.display=st?'':'none';
+  $('filterCard').style.display=st?'':'none';
+  $('modeIntro').textContent=INTRO[dataMode];
+  $('qsFull').textContent=dataMode==='KID'?'Quotes: the whole KID (all five parts)':'Quotes: full paragraph';
+  initFacets();roundHint();
+  if(!lastPayload)$('results').innerHTML=welcomeHtml();}
+function setMode(v){if(v===dataMode)return;dataMode=v;applyModeUI();loaded=false;setChip(null);loadData();}
 function setRound(v){if(v===round&&loaded)return;round=v;segSet('roundSeg',v);roundHint();loaded=false;setChip(null);loadData();}
 function roundHint(){
-  const h={'4':'4th round reports (2013 Methodology).','5':'5th round reports (2022 Methodology) published so far.',
+  const h=dataMode==='KID'?{'4':'Key issues from 4th round evaluations.','5':'Key issues from 5th round evaluations so far.',
+    'both':'Both rounds together. Every KID is labelled with its round, and statistics are shown per round, never added together.'}:{'4':'4th round reports (2013 Methodology).','5':'5th round reports (2022 Methodology) published so far.',
     'both':'Both rounds searched together. Every hit is labelled with its round, and every statistic is shown per round, never added together.'};
   $('roundHint').textContent=h[round]||'';}
 function setSM(v){searchMode=v;segSet('smSeg',v);
@@ -3208,33 +3603,54 @@ try{const pref=localStorage.getItem('fatf_dark');
 function setChip(txt){const c=$('srcChip');
   if(!txt){c.style.display='none';return}
   $('srcChipTxt').textContent=txt;c.style.display='flex';}
-function paths(){return {round_4:$('p4').value.trim(),round_5:$('p5').value.trim(),other:$('po').value.trim()};}
+function paths(){return {round_4:$('p4').value.trim(),round_5:$('p5').value.trim(),kid:$('pk').value.trim(),other:$('po').value.trim()};}
 /* folders typed here are remembered on this computer, so data kept outside
    the tool's folder only has to be pointed to once */
 function restorePaths(){
   try{const p=JSON.parse(localStorage.getItem('fatf_paths')||'{}');
-    $('p4').value=p.round_4||'';$('p5').value=p.round_5||'';$('po').value=p.other||'';
-    if(p.round_4||p.round_5||p.other)$('pathFields').style.display='block';}catch(e){}
-  ['p4','p5','po'].forEach(id=>$(id).addEventListener('change',()=>{
+    $('p4').value=p.round_4||'';$('p5').value=p.round_5||'';$('pk').value=p.kid||'';$('po').value=p.other||'';
+    if(p.round_4||p.round_5||p.kid||p.other)$('pathFields').style.display='block';}catch(e){}
+  ['p4','p5','pk','po'].forEach(id=>$(id).addEventListener('change',()=>{
     try{localStorage.setItem('fatf_paths',JSON.stringify(paths()));}catch(e){}}));}
 
 /* =====================================================================
    Filters: one state, drawn in the rail and in the pop-out
    ===================================================================== */
-const FDEF=[
-  {k:'jur', title:'Jurisdictions', noun:'jurisdiction', ph:'Find a jurisdiction'},
-  {k:'ind', title:'Sections', noun:'section', ph:'Find an IO, recommendation or criterion, e.g. IO.6 or C.20'},
-  {k:'rat', title:'Ratings', noun:'rating', ph:'Find a rating', hint:'Effectiveness or compliance rating'},
-  {k:'crit',title:'Criterion ratings', noun:'criterion rating', ph:'Find a criterion rating'}];
+const FDEFS={
+  MER:[
+    {k:'jur', fk:'jurisdictions', title:'Jurisdictions', noun:'jurisdiction', ph:'Find a jurisdiction'},
+    {k:'ind', fk:'indicators', title:'Sections', noun:'section', ph:'Find an IO, recommendation or criterion, e.g. IO.6 or C.20'},
+    {k:'rat', fk:'ratings', title:'Ratings', noun:'rating', ph:'Find a rating'},
+    {k:'crit',fk:'crit_ratings', title:'Criterion ratings', noun:'criterion rating', ph:'Find a criterion rating'}],
+  KID:[
+    {k:'jur', fk:'jurisdictions', title:'Jurisdictions', noun:'jurisdiction', ph:'Find a jurisdiction'},
+    {k:'ind', fk:'indicators', title:'IOs and Recommendations', noun:'IO or Recommendation', ph:'Find an IO or Recommendation, e.g. IO5 or R.24'},
+    {k:'theme',fk:'themes', title:'Themes', noun:'theme', ph:'Find a theme, e.g. risk, beneficial ownership'},
+    {k:'part', fk:'parts', title:'Where to look in the KID', noun:'part', ph:'Find a part'},
+    {k:'outc', fk:'outcomes', title:'Plenary decision', noun:'decision', ph:'Find a decision'},
+    {k:'plen', fk:'plenaries', title:'Plenary meeting', noun:'Plenary meeting', ph:'Find a year or month, e.g. 2019'},
+    {k:'rat', fk:'ratings', title:'Final rating', noun:'rating', ph:'Find a rating'}]};
+const TDEFS={
+  MER:[{id:'tEff',v:'Effectiveness',t:'Effectiveness',c:'--eff'},{id:'tRC',v:'Risk and Context',t:'Risk and context',c:'--rc'},
+       {id:'tTC',v:'Technical Compliance',t:'Technical compliance',c:'--tc'}],
+  KID:[{id:'tEff',v:'Effectiveness',t:'Effectiveness (IOs)',c:'--eff'},{id:'tTC',v:'Technical Compliance',t:'Technical compliance (Rs)',c:'--tc'},
+       {id:'tGen',v:'General',t:'General',c:'--gen'}]};
+let FDEF=[], TDEF=[];
 const F={};
-FDEF.forEach(d=>F[d.k]=Object.assign({},d,{tree:[],values:[],sel:new Set(),q:'',presets:[],gidx:{},openI:{},openD:{}}));
 let LABELS={}, curTab='jur', gseq=0;
+function initFacets(){
+  FDEF=FDEFS[dataMode]||[];TDEF=TDEFS[dataMode]||[];
+  Object.keys(F).forEach(k=>delete F[k]);
+  FDEF.forEach(d=>F[d.k]=Object.assign({},d,{tree:[],values:[],sel:new Set(),q:'',presets:[],labels:{},gidx:{},openI:{},openD:{}}));
+  curTab='jur';
+  $('tableToggles').innerHTML=TDEF.map(t=>'<label class="ttog" style="--c:var('+t.c+')"><input type="checkbox" id="'+t.id+'" checked onchange="syncTables(this)"><span class="sw"></span>'+esc(t.t)+'</label>').join('');
+  buildRail();refreshAll();}
 
-function lab(k,v){return (k==='rat'||k==='crit')?(LABELS[v]||v):v;}
+function lab(k,v){const f=F[k];return (f&&f.labels&&f.labels[v])||((k==='rat'||k==='crit')?LABELS[v]:null)||v;}
 function setFacet(k,data){
   const f=F[k];
   const wasAll=!f.values.length||f.sel.size===f.values.length;
-  f.tree=(data&&data.tree)||[];f.presets=(data&&data.presets)||[];f.gidx={};
+  f.tree=(data&&data.tree)||[];f.presets=(data&&data.presets)||[];f.labels=(data&&data.labels)||{};f.gidx={};
   const vals=[];
   const walk=n=>{n._g='g'+(++gseq);let its=[];
     (n.items||[]).forEach(v=>{its.push(v);vals.push(v);});
@@ -3303,7 +3719,6 @@ function buildRail(){
   document.querySelectorAll('.fsearch').forEach(inp=>inp.addEventListener('input',()=>{
     const k=inp.dataset.f;F[k].q=inp.value;if(curTab===k&&$('fdlg').open)$('dlgSearch').value=inp.value;refreshFacet(k);}));
   FDEF.forEach(d=>bindList($('fl_'+d.k)));
-  bindList($('dlgList'));
 }
 function bindList(el){
   el.addEventListener('change',e=>{
@@ -3345,22 +3760,21 @@ function syncTables(src){
   if(src){document.querySelectorAll('input[data-mirror="'+src.id+'"]').forEach(m=>m.checked=src.checked);}
   renderSummary();}
 function mirrorTable(m){const src=$(m.dataset.mirror);src.checked=m.checked;syncTables(src);}
-function tablesOn(){return [['tEff','Effectiveness'],['tRC','Risk and Context'],['tTC','Technical Compliance']].filter(x=>$(x[0]).checked).map(x=>x[1]);}
+function tablesOn(){return TDEF.filter(t=>$(t.id)&&$(t.id).checked).map(t=>t.v);}
 function summaryText(){
   const parts=[];
   FDEF.forEach(d=>{const f=F[d.k];if(f.values.length&&f.sel.size!==f.values.length)
     parts.push(f.sel.size?plural(f.sel.size,d.noun)+' of '+f.values.length:'no '+d.noun+'s');});
-  const tb=tablesOn();if(tb.length<3)parts.push(tb.length?tb.join(' and ').toLowerCase()+' only':'no tables');
-  return parts.length?'Narrowed to '+parts.join(', ')+'.':'Searching everything in the loaded reports.';}
+  const tb=tablesOn();if(tb.length<TDEF.length)parts.push(tb.length?tb.join(' and ').toLowerCase()+' only':'no tables');
+  return parts.length?'Narrowed to '+parts.join(', ')+'.':(dataMode==='KID'?'Searching every Key Issue Document loaded.':'Searching everything in the loaded reports.');}
 function renderSummary(){const s=summaryText();$('fSummary').textContent=s;if($('fdlg').open)$('dlgSummary').textContent=s;}
 function renderNav(){
-  const tb=[['tEff','Effectiveness','--eff'],['tRC','Risk and context','--rc'],['tTC','Technical compliance','--tc']];
   $('dlgNav').innerHTML=FDEF.map(d=>{const c=countText(d.k);
     return '<button class="navtab'+(d.k===curTab?' on':'')+'" onclick="showTab(\''+d.k+'\')"><b>'+esc(d.title)+'</b>'
       +'<span class="'+c.c+'">'+esc(c.t)+'</span></button>';}).join('')
     +'<div class="navsep">Tables</div><div class="tabletoggles">'
-    +tb.map(t=>'<label class="ttog" style="--c:var('+t[2]+')"><input type="checkbox" data-mirror="'+t[0]+'"'+($(t[0]).checked?' checked':'')
-      +' onchange="mirrorTable(this)"><span class="sw"></span>'+t[1]+'</label>').join('')+'</div>';}
+    +TDEF.map(t=>'<label class="ttog" style="--c:var('+t.c+')"><input type="checkbox" data-mirror="'+t.id+'"'+($(t.id).checked?' checked':'')
+      +' onchange="mirrorTable(this)"><span class="sw"></span>'+esc(t.t)+'</label>').join('')+'</div>';}
 function showTab(k){
   curTab=k;const f=F[k];const d=FDEF.find(x=>x.k===k);
   $('dlgSearch').value=f.q||'';$('dlgSearch').placeholder=d.ph;
@@ -3378,7 +3792,7 @@ function toggleMax(){const d=$('fdlg');d.classList.toggle('max');$('dlgMax').tex
 function clearFilters(){
   FDEF.forEach(d=>{const f=F[d.k];f.sel=new Set(f.values);f.q='';});
   document.querySelectorAll('.fsearch').forEach(i=>i.value='');$('dlgSearch').value='';
-  ['tEff','tRC','tTC'].forEach(id=>$(id).checked=true);
+  TDEF.forEach(t=>{if($(t.id))$(t.id).checked=true;});
   if($('fdlg').open)renderNav();
   refreshAll();}
 
@@ -3388,15 +3802,17 @@ function clearFilters(){
 async function loadData(){
   spin(true);
   const st=$('loadStatus');
-  st.classList.remove('err');
+  st.classList.remove('err','ok');
   st.textContent='Loading… the very first load of a round takes a while; after that it is quick, even after a restart.';
   const key=dataMode+'|'+round+'|'+JSON.stringify(paths());
   try{
     const j=await post('/api/load',{data_mode:dataMode,round:round,paths:paths()});
     if(!j.ok){st.textContent='Could not load: '+j.error;st.classList.add('err');loaded=false;return;}
     loaded=true;loadedKey=key;
-    if(dataMode==='MER'){
-      st.textContent=j.rounds.map(r=>r.round+': '+r.rows.toLocaleString()+' paragraphs, '
+    if(dataMode!=='OTHER'){
+      const unit=j.unit==='KID'?'KIDs':'paragraphs';
+      st.classList.add('ok');
+      st.textContent=(j.file?'Loaded '+j.file+'\n':'')+j.rounds.map(r=>r.round+': '+r.rows.toLocaleString()+' '+unit+', '
         +r.n_jurisdictions+' jurisdictions\n'
         +Object.entries(r.counts).map(([k,v])=>'  '+k+': '+v.toLocaleString()).join('\n')).join('\n');
       LABELS=j.labels||{};
@@ -3406,9 +3822,10 @@ async function loadData(){
       FDEF.forEach(d=>setFacet(d.k,fx[d.k]));
       refreshAll();
       if($('fdlg').open)showTab(curTab);
+      const src=dataMode==='KID'?'Key issues':'Mutual evaluations';
       if(j.rounds.length===2)
-        setChip('4th and 5th rounds, '+j.rounds[0].n_jurisdictions+' and '+j.rounds[1].n_jurisdictions+' jurisdictions');
-      else setChip(j.rounds[0].round+', '+j.n_jurisdictions+' jurisdictions, '+j.total.toLocaleString()+' paragraphs');
+        setChip(src+', 4th and 5th rounds, '+j.total.toLocaleString()+' '+unit);
+      else setChip(src+', '+j.rounds[0].round+', '+j.n_jurisdictions+' jurisdictions, '+j.total.toLocaleString()+' '+unit);
     }else{
       st.textContent='Other files:\n'+j.files.map(f=>'  '+f.file+': '+
         (f.error?('not readable ('+f.error+')'):(f.rows.toLocaleString()+' searchable pieces'))).join('\n');
@@ -3428,13 +3845,13 @@ function payload(){
     threshold:$('threshold').value,
     export_dir:$('exportDir').value,
     quote_style:$('quoteStyle').value,
-    filters:{jurisdictions:facetVals('jur'),tables:tablesOn(),indicators:facetVals('ind'),
-             ratings:facetVals('rat'),crit_ratings:facetVals('crit')}};
+    filters:Object.assign({tables:tablesOn().length===TDEF.length?[]:tablesOn()},
+      Object.fromEntries(FDEF.map(d=>[d.fk,facetVals(d.k)])))};
 }
 function filterProblem(){
-  if(dataMode!=='MER')return null;
+  if(dataMode==='OTHER')return null;
   for(const d of FDEF){const f=F[d.k];if(f.values.length&&!f.sel.size)return {k:d.k,msg:'No '+d.noun+'s are selected. Tick at least one, or select all.'};}
-  if(!tablesOn().length)return {k:curTab,msg:'No tables are selected. Turn on at least one of Effectiveness, Risk and context or Technical compliance.'};
+  if(!tablesOn().length)return {k:curTab,msg:'No tables are selected. Turn on at least one of '+TDEF.map(t=>t.t).join(', ')+'.'};
   return null;}
 
 /* =====================================================================
@@ -3574,7 +3991,7 @@ async function doSearch(){
     saveHist(p);
     renderResults(j);
     const tot=j.results.reduce((a,b)=>a+b.total,0);
-    let msg='Found '+plural(tot,'hit')+' across '+plural(j.results.length,'term')+'.';
+    let msg='Found '+plural(tot,j.data_mode==='KID'?'KID':'hit')+' across '+plural(j.results.length,'term')+'.';
     if(j.rounds.length===2){
       const r4=j.results.reduce((a,b)=>a+(b.by_round['4th round']||0),0),r5=j.results.reduce((a,b)=>a+(b.by_round['5th round']||0),0);
       msg+=' 4th round: '+r4.toLocaleString()+'. 5th round: '+r5.toLocaleString()+'.';
@@ -3585,7 +4002,7 @@ async function doSearch(){
   finally{stopProgress();spin(false);$('btnSearch').disabled=false;}
 }
 
-const SECS={'Effectiveness':'var(--eff)','Risk and Context':'var(--rc)','Technical Compliance':'var(--tc)'};
+const SECS={'Effectiveness':'var(--eff)','Risk and Context':'var(--rc)','Technical Compliance':'var(--tc)','General':'var(--gen)'};
 
 function covHtml(block,bi){
   const labs=block.rounds||[];if(!labs.length)return '';
@@ -3618,8 +4035,8 @@ function chipsHtml(block){
   return h;
 }
 function secCount(sec,rnd,two){
-  if(rnd!=='all'){const n=sec.by_round[rnd]||0;return plural(n,'hit')+' in the '+rnd;}
-  let s=plural(sec.total,'hit');
+  if(rnd!=='all'){const n=sec.by_round[rnd]||0;return plural(n,unitOf())+' in the '+rnd;}
+  let s=plural(sec.total,unitOf());
   if(two)s+=', 4th '+(sec.by_round['4th round']||0)+', 5th '+(sec.by_round['5th round']||0);
   return s;
 }
@@ -3640,7 +4057,7 @@ function renderResults(j){
     const head=document.createElement('div');head.className='termhead'+(bi<openN?'':' closed');
     head.setAttribute('role','button');head.tabIndex=0;head.setAttribute('aria-expanded',bi<openN);
     let hh='<span class="arrow" aria-hidden="true"></span><span class="termname">'+esc(b.term)+'</span>'
-      +'<span class="hitpill'+(b.total===0?' zero':'')+'">'+plural(b.total,'hit')+'</span>';
+      +'<span class="hitpill'+(b.total===0?' zero':'')+'">'+plural(b.total,unitOf())+'</span>';
     if(two)hh+=b.rounds.map(l=>'<span class="rpill '+RCLS[l]+'">'+RSHORT[l]+' '+(b.by_round[l]||0).toLocaleString()+'</span>').join('');
     if(b.aliases&&b.aliases.length>1)
       hh+='<span class="aliaswrap" title="All of these are treated as the same term">also '+b.aliases.slice(1).map(a=>'<span class="alias">'+esc(a)+'</span>').join('')+'</span>';
@@ -3690,8 +4107,12 @@ function setCardRound(bi,lab){
   const b=lastResults[bi];
   b.sections.forEach((s,si)=>{$('cnt'+bi+'_'+si).textContent=secCount(s,lab,true);loadSection(bi,si,false,PAGE);});
 }
-function tableShell(two,isMer){
-  if(isMer)return '<table class="results"><colgroup>'+(two?'<col style="width:56px">':'')
+function unitOf(){return lastMode==='KID'?'KID':'hit';}
+function tableShell(two,kind){
+  if(kind==='KID')return '<table class="results"><colgroup>'+(two?'<col style="width:56px">':'')
+      +'<col style="width:13%"><col style="width:104px"><col style="width:20%"><col style="width:128px"><col><col style="width:68px"></colgroup>'
+      +'<thead><tr>'+(two?'<th>Round</th>':'')+'<th>Jurisdiction</th><th>KID</th><th>IO or Recommendation, theme</th><th>Plenary decision</th><th>Where the term appears</th><th><span class="sr">Actions</span></th></tr></thead><tbody></tbody></table>';
+  if(kind==='MER')return '<table class="results"><colgroup>'+(two?'<col style="width:56px">':'')
       +'<col style="width:13%"><col style="width:84px"><col style="width:17%"><col style="width:76px"><col><col style="width:68px"></colgroup>'
       +'<thead><tr>'+(two?'<th>Round</th>':'')+'<th>Jurisdiction</th><th>Measure</th><th>Indicator</th><th>Rating</th><th>Term in context</th><th><span class="sr">Actions</span></th></tr></thead><tbody></tbody></table>';
   return '<table class="results"><colgroup><col style="width:24%"><col style="width:32%"><col><col style="width:68px"></colgroup>'
@@ -3706,9 +4127,23 @@ function readTools(x){
   return '<div class="rowtools"><button class="readbtn" aria-expanded="false" onclick="toggleDoc(this,\''+x._id+'\')">Read paragraph</button>'
     +fmtTags(x.html)+'</div>';
 }
-function rowHtml(x,two,isMer){
+function decisionPill(o){const c=o==='Upgrade'?'up':o==='Downgrade'?'down':'same';
+  return '<span class="decision '+c+'">'+esc(o||'Not recorded')+'</span>';}
+function kidShort(k){return String(k||'').replace(/\s*\([^)]*\)\s*$/,'');}
+function rowHtml(x,two,kind){
   const cls=excluded.has(x._id)?' dropped':'';
-  if(isMer){
+  if(kind==='KID'){
+    return '<tr class="hit'+cls+'" data-id="'+x._id+'">'+(two?'<td>'+rtag(x.Round)+'</td>':'')
+      +'<td class="jur">'+esc(x.Jurisdiction)+'</td>'
+      +'<td><b>'+esc(kidShort(x.KID))+'</b><span class="smallmeta">'+esc(x.PlenaryLabel||'')+' Plenary</span></td>'
+      +'<td>'+esc(x.Indicator)+'<span class="smallmeta">'+esc(x.Theme||'')+'</span></td>'
+      +'<td>'+decisionPill(x.Outcome)+(x.Rating&&x.Rating!=='NA'?'<span class="smallmeta">Final rating '+pill(x.Rating)+'</span>':'')+'</td>'
+      +'<td class="ctx">'+hl(x.context.replace(/^\[[^\]]*\]\s*/,''),x.matched,x.variants)
+      +'<div class="rowtools"><button class="readbtn" aria-expanded="false" onclick="toggleDoc(this,\''+x._id+'\')">Open KID</button>'
+      +'<span class="smallmeta" style="display:inline;margin:0 2px 0 4px">Found in</span>'
+      +(x.matched_parts||[]).map(n=>'<span class="parttag">'+esc(n)+'</span>').join('')+'</div></td>'+actions(x._id)+'</tr>';
+  }
+  if(kind==='MER'){
     const crit=(x['Criteria rating']&&x['Criteria rating']!=='NA')?'<br>'+pill(x['Criteria rating']):'';
     return '<tr class="hit'+cls+'" data-id="'+x._id+'">'+(two?'<td>'+rtag(x.Round)+'</td>':'')
       +'<td class="jur">'+esc(x.Jurisdiction)+'</td><td class="meas">'+esc(x.MEASURE)+'</td><td>'+esc(x.Indicator)+'</td>'
@@ -3720,7 +4155,32 @@ function rowHtml(x,two,isMer){
     +'</td><td class="ctx">'+hl(x['Sentence with term'],x.matched,x.variants)+'</td>'
     +'<td class="ctx">'+hl(x.context,x.matched,x.variants)+readTools(x)+'</td>'+actions(x._id)+'</tr>';
 }
+function kidNode(x,color){
+  const art=document.createElement('div');art.className='doc';art.style.setProperty('--c',color);
+  const top=document.createElement('div');top.className='kidtop';
+  top.innerHTML='<div class="kidtitle">'+esc(kidShort(x.KID))+'<small>'+esc(x.Jurisdiction)+', '+esc(x.Round)+'</small></div>'
+    +'<span class="sp"></span><button class="linkbtn" onclick="copyCite(\''+x._id+'\',this)">Copy quote</button>'
+    +'<dl class="kidmeta">'
+    +'<div><dt>IO or Recommendation</dt><dd>'+esc(x.Indicator)+'</dd></div>'
+    +'<div><dt>Theme</dt><dd>'+esc(x.Theme||'')+'</dd></div>'
+    +'<div><dt>Plenary</dt><dd>'+esc(x.PlenaryLabel||'')+'</dd></div>'
+    +'<div><dt>Decision</dt><dd>'+decisionPill(x.Outcome)+(x.Rating&&x.Rating!=='NA'?' &nbsp;final rating '+pill(x.Rating):'')+'</dd></div>'
+    +'</dl>';
+  const ol=document.createElement('ol');ol.className='steps';
+  (x.parts||[]).forEach((pt,i)=>{
+    const li=document.createElement('li');if(pt.hit)li.className='hit';
+    li.innerHTML='<span class="stepdot">'+(i+1)+'</span><div class="steplabel">'+esc(pt.part)
+      +(pt.hit?'<span class="found">term found here</span>':'')+'</div>';
+    const body=document.createElement('div');body.className='stepbody docbody';
+    if(pt.html){body.innerHTML=pt.html;shapeDoc(body);if(pt.hit)markDom(body,x.matched,x.variants);}
+    else{body.classList.add('emptypart');body.textContent='Nothing recorded.';}
+    li.appendChild(body);ol.appendChild(li);});
+  const foot=document.createElement('div');foot.className='hint';foot.style.marginTop='14px';
+  foot.textContent='Cite as: '+(x.ref||'');
+  art.appendChild(top);art.appendChild(ol);art.appendChild(foot);return art;
+}
 function docNode(x,color){
+  if(x.parts)return kidNode(x,color);
   const art=document.createElement('div');art.className='doc';art.style.setProperty('--c',color);
   const head=document.createElement('div');head.className='dochead';
   head.innerHTML='<span class="cite">'+esc(x.ref||'')+'</span>'+(x.Indicator?'<span>'+esc(x.Indicator)+'</span>':'')
@@ -3732,18 +4192,19 @@ function docNode(x,color){
 }
 function toggleDoc(btn,id){
   const tr=btn.closest('tr');const nx=tr.nextElementSibling;
-  if(nx&&nx.classList.contains('docrow')&&nx.dataset.for===id){nx.remove();btn.setAttribute('aria-expanded','false');btn.textContent='Read paragraph';return;}
+  const isKid=!!(rowCache[id]&&rowCache[id].parts);
+  if(nx&&nx.classList.contains('docrow')&&nx.dataset.for===id){nx.remove();btn.setAttribute('aria-expanded','false');btn.textContent=isKid?'Open KID':'Read paragraph';return;}
   const x=rowCache[id];if(!x)return;
   const row=document.createElement('tr');row.className='docrow';row.dataset.for=id;
   const td=document.createElement('td');td.colSpan=tr.children.length;
   const sec=tr.closest('.tblsec');const color=sec?getComputedStyle(sec).getPropertyValue('--c')||'var(--accent)':'var(--accent)';
   td.appendChild(docNode(x,color));row.appendChild(td);tr.after(row);
-  btn.setAttribute('aria-expanded','true');btn.textContent='Close paragraph';
+  btn.setAttribute('aria-expanded','true');btn.textContent=isKid?'Close KID':'Close paragraph';
 }
 
 async function loadSection(bi,si,append,limit){
   const st=cards[bi];const b=lastResults[bi];const sec=b.sections[si];
-  const two=(b.rounds||[]).length===2;const isMer=lastMode==='MER';
+  const two=(b.rounds||[]).length===2;const isMer=lastMode!=='OTHER';const kind=lastMode;
   const box=$('sb'+bi+'_'+si);
   if(sec.error){box.innerHTML='<div class="empty">Not searched: '+esc(sec.error)+'</div>';return;}
   const off=append?(st.shown[si]||0):0;
@@ -3757,9 +4218,9 @@ async function loadSection(bi,si,append,limit){
   j.rows.forEach(x=>rowCache[x._id]=x);
   if(!append){
     if(!j.total){st.shown[si]=0;box.innerHTML='<div class="empty">No results'+(reqRound!=='all'?' in the '+esc(reqRound):' in this '+(isMer?'table':'file'))+'.</div>';return;}
-    box.innerHTML=tableShell(two&&reqRound==='all',isMer);
+    box.innerHTML=tableShell(two&&reqRound==='all',kind);
   }
-  box.querySelector('tbody').insertAdjacentHTML('beforeend',j.rows.map(x=>rowHtml(x,two&&reqRound==='all',isMer)).join(''));
+  box.querySelector('tbody').insertAdjacentHTML('beforeend',j.rows.map(x=>rowHtml(x,two&&reqRound==='all',kind)).join(''));
   st.shown[si]=off+j.rows.length;
   const old=box.querySelector('.morebar');if(old)old.remove();
   const left=j.total-st.shown[si];
@@ -3830,7 +4291,7 @@ async function openFolder(){try{const j=await post('/api/open_folder',{folder:$(
   if(!j.ok)alert('Could not open the folder: '+j.error);}catch(e){alert('Could not open the folder: '+e);}}
 
 function clearAll(){$('terms').value='';
-  $('results').innerHTML=WELCOME;
+  lastPayload=null;$('results').innerHTML=welcomeHtml();
   $('searchStatus').textContent='';$('interp').style.display='none';$('interp').innerHTML='';
   ['btnExportX','btnExportW','btnExportB'].forEach(id=>$(id).disabled=true);
   lastPayload=null;excluded.clear();clearFilters();countTerms();fileNamePreview();}
@@ -3841,7 +4302,9 @@ function saveHist(p){
   let h=histGet();
   h.unshift({t:p.terms,mode:p.data_mode,round:p.round,sm:p.search_mode,when:new Date().toLocaleString()});
   histSet(h.slice(0,25));renderHist();}
-function histSrc(x){return (x.mode==='OTHER')?'Other files':(x.round==='both'?'Both rounds':(x.round==='4'?'4th round':(x.round==='5'?'5th round':'')));}
+function histSrc(x){if(x.mode==='OTHER')return 'Other files';
+  const r=x.round==='both'?'both rounds':(x.round==='4'?'4th round':(x.round==='5'?'5th round':''));
+  return (x.mode==='KID'?'Key issues, ':'MER, ')+r;}
 function renderHist(){
   const h=histGet();const el=$('hist');
   if(!h.length){el.innerHTML='<div class="empty">No searches yet.</div>';return;}
@@ -3850,9 +4313,8 @@ async function reuse(i){const x=histGet()[i];if(!x)return;
   $('terms').value=x.t.join('\n');countTerms();fileNamePreview();
   if(x.sm)setSM(x.sm);
   const needMode=x.mode||'MER';
-  if(needMode!==dataMode){dataMode=needMode;segSet('modeSeg',needMode);
-    $('roundWrap').style.display=(needMode==='MER')?'':'none';$('filterCard').style.display=(needMode==='MER')?'':'none';loaded=false;}
-  if(needMode==='MER'&&x.round&&x.round!==round){round=x.round;segSet('roundSeg',round);roundHint();loaded=false;}
+  if(needMode!==dataMode){dataMode=needMode;applyModeUI();loaded=false;}
+  if(needMode!=='OTHER'&&x.round&&x.round!==round){round=x.round;segSet('roundSeg',round);roundHint();loaded=false;}
   if(!loaded)await loadData();
   window.scrollTo({top:0});}
 function countTerms(){
@@ -3866,9 +4328,9 @@ $('dlgSearch').addEventListener('input',()=>{const f=F[curTab];f.q=$('dlgSearch'
   const rs=document.querySelector('.fsearch[data-f="'+curTab+'"]');if(rs)rs.value=f.q;refreshFacet(curTab);});
 $('dlgOnly').addEventListener('change',()=>refreshFacet(curTab));
 $('fdlg').addEventListener('click',e=>{if(e.target===$('fdlg'))closeFilters();});   // click on the backdrop
-$('results').innerHTML=WELCOME;
 restorePaths();
-buildRail();refreshAll();
+bindList($('dlgList'));
+applyModeUI();
 countTerms();fileNamePreview();roundHint();renderHist();
 loadData();          // load the default round straight away
 </script>

@@ -2,7 +2,7 @@
 
 **Version 9 (15 October 2026)**
 
-A keyword-search tool for FATF Mutual Evaluation Reports (MERs). It searches the 4th round, the 5th round, or both together, and can also search your own Word, PDF and Excel documents. Results export to Excel and to a Word report, with a citation for every quote.
+A keyword-search tool for FATF Mutual Evaluation Reports (MERs) and Key Issue Documents (KIDs). It searches the 4th round, the 5th round, or both together, and can also search your own Word, PDF and Excel documents. Results export to Excel and to a Word report, with a citation for every quote.
 
 The tool runs on your own computer. Nothing is uploaded anywhere: it opens as a page in your browser, served from your own computer.
 
@@ -25,6 +25,7 @@ The tool runs on your own computer. Nothing is uploaded anywhere: it opens as a 
 
 ## What it can do
 
+- **Search the Key Issue Documents.** Each KID records an issue debated at Plenary in five parts: the key issue, the ECG discussion, the ECG proposal, the Plenary discussion and the Plenary decision. A hit is one KID; it opens to the full record as a five-step timeline with the parts that matched highlighted. Filter by jurisdiction, IO or Recommendation, theme, part of the KID, Plenary decision (upgrade, downgrade, text amendment), Plenary meeting and final rating. Exports have one row per KID with each part in its own column (Excel) and the whole KID under each country (Word).
 - **Search every MER paragraph** in the OECD Data Explorer datasets: Effectiveness (IO.1 to IO.11), Risk and Context (including the executive summary) and Technical Compliance (R.1 to R.40, criterion by criterion).
 - **Search the 4th round, the 5th round, or both.** In "Both rounds", every hit is tagged 4th or 5th round, and counts and coverage are always shown per round, never added together. The rounds cover different countries and use different methodologies (2013 and 2022).
 - **Read each hit as it appears in the report.** "Read paragraph" opens the full paragraph with its original formatting: tables, the shaded case-study boxes, lists, bold text and footnote marks, with the matched words highlighted. Hits that contain a table, box or list are labelled.
@@ -89,10 +90,13 @@ source files/
   MER/
     round_4/   <- the two 4th round CSVs
     round_5/   <- the two 5th round CSVs
+  KID/         <- the Key Issue Documents CSV (name contains KID)
   other/       <- your own Word / PDF / Excel / CSV / text files
 ```
 
 The tool finds the files by name, so a newer download only needs dropping in to replace the old one. The first load of the 4th round takes 20 to 60 seconds (and once more after updating to a new version). After that the tool keeps a cache in `%LOCALAPPDATA%\MER_Search_cache`, so later loads take about a second. You can delete the cache at any time and it will rebuild itself.
+
+For the Key Issue Documents, download the **DF_KID** table from OECD Data Explorer (the full table, with labels) and put the CSV in `source files/KID/`. One file holds both rounds.
 
 ## Writing search terms
 

@@ -1,0 +1,5 @@
+Put the Key Issue Documents CSV in this folder:
+  - the file from OECD Data Explorer whose name contains  KID  (e.g. OECD.FATF...DF_KID...csv)
+The tool finds it by that keyword, so the date-stamp in the file name
+does not matter. Use the full table with labels ("complete" download).
+You can delete this text file.

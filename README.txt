@@ -20,6 +20,17 @@ WHAT IS NEW IN v9
   exactly the same as in v8. Exports are unchanged (plain-text quotes).
   HTML in your own CSV / Excel cells (Other files) is shown the same way.
 
+* KEY ISSUE DOCUMENTS. A third source next to the mutual evaluations
+  and your own files. Put the DF_KID CSV from OECD Data Explorer in
+  "source files\KID". Each hit is one KID; "Open KID" shows the whole
+  record as five steps (key issue, ECG discussion, ECG proposal, Plenary
+  discussion, Plenary decision) with the parts that mention the term
+  highlighted, and tracked text amendments shown as in the original.
+  Extra filters: theme, part of the KID, Plenary decision (upgrade /
+  downgrade / text amendment), Plenary meeting and final rating.
+  Excel: one row per KID with each part in its own column, term in bold.
+  Word: the KIDs grouped by round and country, each with all five parts.
+
 * NEW FILTER PANEL. Each filter (jurisdictions, sections, ratings,
   criterion ratings) is now a checklist instead of a Ctrl+click list:
     - a search box, plus All / None for whatever is shown;
