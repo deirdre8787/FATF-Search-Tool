@@ -1,6 +1,6 @@
 # FATF Search Tool
 
-**Version 8 (30 September 2026)**
+**Version 9 (15 October 2026)**
 
 A keyword-search tool for FATF Mutual Evaluation Reports (MERs). It searches the 4th round, the 5th round, or both together, and can also search your own Word, PDF and Excel documents. Results export to Excel and to a Word report, with a citation for every quote.
 
@@ -27,7 +27,8 @@ The tool runs on your own computer. Nothing is uploaded anywhere: it opens as a 
 
 - **Search every MER paragraph** in the OECD Data Explorer datasets: Effectiveness (IO.1 to IO.11), Risk and Context (including the executive summary) and Technical Compliance (R.1 to R.40, criterion by criterion).
 - **Search the 4th round, the 5th round, or both.** In "Both rounds", every hit is tagged 4th or 5th round, and counts and coverage are always shown per round, never added together. The rounds cover different countries and use different methodologies (2013 and 2022).
-- **Filter** by jurisdiction, table, section (for example IO.6 or C.20.1), rating and criterion rating. Filters also set the denominator for "x of y jurisdictions".
+- **Read each hit as it appears in the report.** "Read paragraph" opens the full paragraph with its original formatting: tables, the shaded case-study boxes, lists, bold text and footnote marks, with the matched words highlighted. Hits that contain a table, box or list are labelled.
+- **Filter** by jurisdiction, table, section (for example IO.6 or C.20.1), rating and criterion rating. Each filter is a checklist with search, *All* and *None*, and a tick box on every group, so you can select a whole section (all of IO.6, all of R.20, all FATF members) in one click. **Expand** opens the filters in a large window (with a full-screen option) for long lists. Filters also set the denominator for "x of y jurisdictions".
 - **See what actually matched.** Each term shows the spellings found in the text and how many times each appears. This is the quickest way to spot false hits, which you can remove before exporting.
 - **Compare rounds.** For countries with both a 4th and a 5th round report, the tool shows whether a term appears in one round, both or neither.
 - **Export** to Excel (filterable tables) and to a Word report (quotes grouped by round and country, each with a citation such as *Austria, 5th round MER, IO.4 (rated ME)*).
@@ -42,7 +43,7 @@ The tool runs on your own computer. Nothing is uploaded anywhere: it opens as a 
 3. Double-click **`run_search_tool.bat`**. The first time, it installs Flask, which the tool needs.
 4. Your browser opens at **http://127.0.0.1:5177**. Keep the black window open while you use the tool, and close it to stop.
 
-The header should say **v8 (30 Sep 2026)**. If it shows an older version, close every black window, run the .bat again and press Ctrl+F5 in the browser.
+The header should say **v9 (15 Oct 2026)**. If it shows an older version, close every black window, run the .bat again and press Ctrl+F5 in the browser.
 
 On Mac or Linux, or without the .bat file:
 
@@ -74,7 +75,7 @@ source files/
   other/       <- your own Word / PDF / Excel / CSV / text files
 ```
 
-The tool finds the files by name, so a newer download only needs dropping in to replace the old one. The first load of the 4th round takes 20 to 60 seconds. After that the tool keeps a cache in `%LOCALAPPDATA%\MER_Search_cache`, so later loads take about a second. You can delete the cache at any time and it will rebuild itself.
+The tool finds the files by name, so a newer download only needs dropping in to replace the old one. The first load of the 4th round takes 20 to 60 seconds (and once more after updating to a new version). After that the tool keeps a cache in `%LOCALAPPDATA%\MER_Search_cache`, so later loads take about a second. You can delete the cache at any time and it will rebuild itself.
 
 ## Writing search terms
 

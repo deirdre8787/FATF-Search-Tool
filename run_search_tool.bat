@@ -1,9 +1,9 @@
 @echo off
-title MER Search Tool v8
+title MER Search Tool v9
 cd /d "%~dp0"
 
 echo ==========================================================
-echo   MER Search Tool  v8
+echo   MER Search Tool  v9
 echo   Search the 4th round, the 5th round, or both together
 echo ==========================================================
 echo.
