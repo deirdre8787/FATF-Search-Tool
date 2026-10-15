@@ -54,6 +54,23 @@ python app.py
 
 **Optional extras:** `rapidfuzz` speeds up fuzzy mode, and `pypdf` is needed to search PDFs. Both are in `requirements.txt`.
 
+### Staying up to date automatically
+
+Instead of downloading a ZIP each time, install the tool once with git and let the launcher update it:
+
+1. Install [Git for Windows](https://git-scm.com/download/win) (all the default options are fine).
+2. Open a Command Prompt in your Documents folder and run:
+   ```
+   git clone https://github.com/deirdre8787/fatf-search-tool.git Search_tool
+   ```
+3. Put the MER CSVs in `Search_tool\source files\...` as below, and double-click `run_search_tool.bat`.
+
+Every time you start it, `run_search_tool.bat` fetches the newest version from GitHub (`git pull`) before opening the tool. Your CSVs, your own documents and your exports are never uploaded or overwritten, because git ignores them. If you are offline, it starts the copy you already have.
+
+Do not edit the tool's own files in that folder: a local edit stops the update. (To undo local edits: `git checkout -- .`)
+
+**Keeping the data somewhere else.** If you prefer to keep the CSVs in another folder (for example a shared drive), click *Change source folders* in the tool and paste the folder paths. The tool remembers them on that computer.
+
 ## Getting the MER data
 
 The MER data is not included in this repository. Download it from OECD Data Explorer, which has two CSV files for each round:

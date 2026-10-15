@@ -8,6 +8,25 @@ echo   Search the 4th round, the 5th round, or both together
 echo ==========================================================
 echo.
 
+rem ---- get the latest version (only if this folder came from git clone) --
+rem Your CSVs in "source files" and your exports are never touched: git ignores them.
+if exist ".git" (
+  where git >nul 2>&1
+  if errorlevel 1 (
+    echo Git is not installed, so the tool cannot update itself. Starting this copy.
+  ) else (
+    echo Checking for a newer version...
+    git pull --ff-only --quiet
+    if errorlevel 1 (
+      echo Could not update ^(no internet, or files in this folder were edited^).
+      echo Starting the copy you already have.
+    ) else (
+      echo Up to date.
+    )
+  )
+  echo.
+)
+
 rem ---- find a working Python -------------------------------------------
 set "PY="
 where python >nul 2>&1 && set "PY=python"
