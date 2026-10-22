@@ -31,6 +31,15 @@ WHAT IS NEW IN v9
   Excel: one row per KID with each part in its own column, term in bold.
   Word: the KIDs grouped by round and country, each with all five parts.
 
+* CASE STUDIES. A fourth source: the case study boxes in the
+  effectiveness chapters of the MERs (4th and 5th round). Each one shows
+  its round, country, IO, core issue and rating. Leave the search box
+  empty and press Search to list every case study that matches your
+  filters, or type words to narrow them down. Excel has one row per case
+  study with its full text; Word groups them by round and country.
+  A box counts as a case study when its title mentions a case or an
+  example; other boxes can be included with the "Type of box" filter.
+
 * NEW FILTER PANEL. Each filter (jurisdictions, sections, ratings,
   criterion ratings) is now a checklist instead of a Ctrl+click list:
     - a search box, plus All / None for whatever is shown;

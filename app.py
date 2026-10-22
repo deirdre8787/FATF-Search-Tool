@@ -77,10 +77,11 @@ PORT          = 5177
 ROUND_LABEL = {"4": "4th round", "5": "5th round"}
 TABLES = ["Effectiveness", "Risk and Context", "Technical Compliance"]
 KID_TABLES = ["Effectiveness", "Technical Compliance", "General"]
-STRUCTURED = ("MER", "KID")          # sources with rounds, jurisdictions and ratings
+CASE_TABLES = ["Effectiveness"]
+STRUCTURED = ("MER", "KID", "CASE")   # sources with rounds, jurisdictions and ratings
 
 def tables_for(mode):
-    return KID_TABLES if mode == "KID" else TABLES
+    return {"KID": KID_TABLES, "CASE": CASE_TABLES}.get(mode, TABLES)
 
 def rounds_of(sel):
     """'4' -> ['4'], '5' -> ['5'], 'both' -> ['4', '5']"""
@@ -94,6 +95,9 @@ def round_labels(sel):
 
 def source_label(sel, mode="MER"):
     rs = rounds_of(sel)
+    if mode == "CASE":
+        return "MER case studies, " + (
+            "4th and 5th round" if len(rs) == 2 else ROUND_LABEL[rs[0]])
     if mode == "KID":
         return "Key Issue Documents, " + (
             "4th and 5th round" if len(rs) == 2 else ROUND_LABEL[rs[0]])
@@ -553,9 +557,131 @@ def load_kid(sel):
     df, _ = load_kid_all()
     return df[df["Round"].isin(round_labels(sel))]
 
+# =============================================================================
+# CASE STUDIES (boxes in the effectiveness chapters of the MERs)
+# =============================================================================
+# MERs set case studies apart in boxes ("Box 3.2. Case example: ..."). In the
+# HTML these are single-cell tables, or blocks with shading or a border. Each
+# box becomes one record; boxes whose title mentions a case or an example are
+# case studies, the others are kept as "Other box" so nothing is lost.
+from xml.etree import ElementTree as _ET
+
+CASE_COLS = ["BoxTitle", "BoxKind", "CoreIssue", "BoxNo", "Lines"]
+_CASE_TITLE = re.compile(r"\bcase\b|\bcases\b|\bexample|\bcase[- ]stud", re.I)
+_BOX_TITLE = re.compile(r"^\s*Box\s+[\dA-Z]+(\.\d+)*", re.I)
+
+def _box_candidates(root):
+    """Outermost elements that look like a box."""
+    found = []
+    def is_box(el):
+        tag = el.tag
+        cls = el.get("class", "")
+        if tag == "table":
+            rows = [ch for ch in el if ch.tag == "tr"] + [
+                tr for sec in el if sec.tag in ("thead", "tbody", "tfoot")
+                for tr in sec if tr.tag == "tr"]
+            cells = [c for tr in rows for c in tr if c.tag in ("td", "th")]   # not nested tables
+            if len(cells) == 1:
+                return True
+            if "shaded" in cls and len(cells) <= 2:
+                return True
+            txt = "".join(el.itertext()).strip()
+            return bool(_BOX_TITLE.match(txt)) and len(cells) <= 2
+        if tag in ("div", "blockquote", "p") and ("boxed" in cls or "shaded" in cls):
+            return True
+        return False
+    def walk(el):
+        for ch in el:
+            if is_box(ch):
+                found.append(ch)
+            else:
+                walk(ch)
+    walk(root)
+    return found
+
+def _box_title(text):
+    first = next((ln.strip() for ln in text.split("\n") if ln.strip()), "")
+    return first[:240]
+
+def extract_boxes(html):
+    """[(title, html, lines, plain_text)] for every box in one paragraph."""
+    if not html or ("<table" not in html and "class=" not in html):
+        return []
+    xml = re.sub(r"<(br|hr|col)(\s[^>]*?)?\s*/?>", r"<\1\2/>", html)
+    try:
+        root = _ET.fromstring("<root>" + xml + "</root>")
+    except _ET.ParseError:
+        return []
+    out = []
+    for el in _box_candidates(root):
+        frag = _ET.tostring(el, encoding="unicode", method="html")
+        lines = html_to_lines(frag)
+        if not lines.strip():
+            continue
+        out.append((_box_title(lines), frag, lines, strip_html(frag)))
+    return out
+
+def _core_issue(measure):
+    m = re.match(r"IO(\d+)CI(\d+)", str(measure or ""))
+    return f"{m.group(1)}.{m.group(2)}" if m else ""
+
+def _build_cases(df):
+    eff = df[(df["Table"] == "Effectiveness") & (df["OBS_HTML"] != "")] \
+        if "OBS_HTML" in df.columns else df.iloc[0:0]
+    rows = []
+    for rec in eff.to_dict("records"):
+        for no, (title, frag, lines, text) in enumerate(extract_boxes(rec["OBS_HTML"]), 1):
+            r = {c: rec[c] for c in UNIFORM_COLS}
+            r.update({"OBS_VALUE": text, "OBS_HTML": frag, "Lines": lines,
+                      "BoxTitle": title, "BoxNo": no,
+                      "BoxKind": "Case study" if _CASE_TITLE.search(title) else "Other box",
+                      "CoreIssue": _core_issue(rec["MEASURE"])})
+            rows.append(r)
+    out = pd.DataFrame(rows, columns=UNIFORM_COLS + ["OBS_HTML"] + CASE_COLS)
+    out["_norm"] = [norm_text(t) for t in out["OBS_VALUE"].tolist()]
+    return out
+
+def load_cases_round(rn):
+    base = load_round(rn)
+    hit = _CACHE.get("case" + rn)
+    if hit is not None and hit[0] is base:
+        return hit[1]
+    cases = _build_cases(base)
+    _CACHE["case" + rn] = (base, cases)
+    return cases
+
+def load_cases(sel):
+    parts = [load_cases_round(r) for r in rounds_of(sel)]
+    return parts[0] if len(parts) == 1 else pd.concat(parts, ignore_index=True)
+
+def list_cases(df, filters):
+    """Every box matching the filters, for a search with no words."""
+    sub = apply_filters(df, filters)
+    results = []
+    for rec in sub.drop(columns=["_norm"]).to_dict("records"):
+        r = {c: rec[c] for c in UNIFORM_COLS}
+        r.update({c: rec[c] for c in CASE_COLS})
+        r["html"] = rec["OBS_HTML"]
+        text = rec["OBS_VALUE"]
+        r["context"] = text[:600] + ("..." if len(text) > 600 else "")
+        r["sentence"] = rec["BoxTitle"]
+        r["matched"] = ""
+        r["variants"] = []
+        r["ref"] = citation(r)
+        r["_id"] = row_id(r)
+        results.append(r)
+    results.sort(key=lambda r: (r["Jurisdiction"], r["Round"], _measure_key(r["MEASURE"]),
+                                r["BoxNo"]))
+    return results
+
 def load_struct(p):
-    """The table behind a structured source (MER or KID) for this search."""
-    return load_kid(p["round"]) if p.get("data_mode") == "KID" else load_mer(p["round"])
+    """The table behind a structured source (MER, KID, CASE) for this search."""
+    mode = p.get("data_mode")
+    if mode == "KID":
+        return load_kid(p["round"])
+    if mode == "CASE":
+        return load_cases(p["round"])
+    return load_mer(p["round"])
 
 MAX_RECORDS_PER_FILE = 40000
 
@@ -1102,7 +1228,7 @@ def apply_filters(df, filters):
     if f.get("crit_ratings"):
         sub = sub[sub["Criteria rating"].isin(f["crit_ratings"])]
     for key, col in (("themes", "ThemeCode"), ("parts", "Part"), ("outcomes", "Outcome"),
-                     ("plenaries", "Plenary")):
+                     ("plenaries", "Plenary"), ("boxkinds", "BoxKind")):
         if f.get(key) and col in sub.columns:
             sub = sub[sub[col].isin(f[key])]
     return sub
@@ -1145,10 +1271,14 @@ def citation(r):
             ref += f', final rating {r["Rating"]}'
         return ref
     ref = f'{r["Jurisdiction"]}, {r["Round"]} MER, {pretty_measure(r["MEASURE"])}'
+    if r.get("CoreIssue"):
+        ref += f', core issue {r["CoreIssue"]}'
     if r.get("Rating") and r["Rating"] != "NA":
         ref += f' (rated {r["Rating"]})'
     if r.get("Criteria rating") and r["Criteria rating"] != "NA":
         ref += f', criterion {r["Criteria rating"]}'
+    if r.get("BoxTitle"):
+        ref += f', {r["BoxTitle"][:120]}'
     return ref
 
 def row_id(r):
@@ -1168,6 +1298,7 @@ def search_mer(df, tp, mode, threshold, filters):
     cols = {c: sub[c].tolist() for c in UNIFORM_COLS}
     texts = cols["OBS_VALUE"]
     htmls = sub["OBS_HTML"].tolist() if "OBS_HTML" in sub.columns else [""] * len(texts)
+    extra = {c: sub[c].tolist() for c in CASE_COLS if c in sub.columns}
     if mode in ("strict", "exact"):
         norms = sub["_norm"].tolist()
         groups = [g for g in tp["ptokens"] if g]
@@ -1183,6 +1314,8 @@ def search_mer(df, tp, mode, threshold, filters):
             continue
         start, end, variants = hit
         r = {c: cols[c][i] for c in UNIFORM_COLS}
+        for c in extra:
+            r[c] = extra[c][i]
         r["html"] = htmls[i]
         r["context"] = make_context(text, start, end)
         r["sentence"] = sentence_of(text, start, end)
@@ -1362,6 +1495,12 @@ def run_search(p, sid=None):
         df = load_struct(p)
         searcher = search_kid if p["data_mode"] == "KID" else search_mer
         known = sorted(df["Jurisdiction"].unique().tolist())
+        if p["data_mode"] == "CASE" and not terms:
+            filters = dict(p.get("filters", {}) or {})
+            raw.append({"term": "All case studies", "aliases": [], "scope": None,
+                        "notes": ["No search words: every box that matches the filters."],
+                        "how": [], "warn": [], "input": "", "filters": filters,
+                        "results": list_cases(df, filters)})
         for i, group in enumerate(terms):
             _set_progress(sid, i, len(terms), group)
             tp = prepare_term(group, mode, csa, known)
@@ -1452,7 +1591,7 @@ def _slim_row(r):
             "Criteria rating", "OBS_VALUE", "html", "context", "sentence", "matched",
             "variants", "ref", "File", "Location", "Sentence with term", "Details",
             "Full text", "KID", "Theme", "Outcome", "Plenary", "PlenaryLabel", "parts",
-            "matched_parts")
+            "matched_parts", "BoxTitle", "BoxKind", "CoreIssue")
     return {k: r[k] for k in keep if k in r}
 
 
@@ -1625,8 +1764,9 @@ def _stat_line(b, lab):
     nby = Counter(x["Table"] for x in rows)
     meas = Counter(pretty_measure(x["MEASURE"]) for x in rows if x["MEASURE"])
     rat = Counter(x["Rating"] for x in rows if x.get("Rating") and x["Rating"] != "NA")
-    unit = "KID" if rows and rows[0].get("KID") else "mention"
-    s = (f"{lab.upper()}:  {len(rows)} {unit}{'s' if len(rows) != 1 else ''} in "
+    unit = ("KID" if rows and rows[0].get("KID") else
+            "case study" if rows and rows[0].get("BoxTitle") else "mention")
+    s = (f"{lab.upper()}:  {len(rows)} {_units(len(rows), unit)} in "
          f"{cov['mentioned']} of {cov['total']} jurisdictions ({cov['pct']}%)   |   "
          + ", ".join(f"{t} {nby.get(t, 0)}" for t in b.get("tables", TABLES)))
     if unit == "KID":
@@ -1641,6 +1781,7 @@ def _stat_line(b, lab):
 def _write_summary(ws, p, blocks, sheet_names):
     is_mer = p["data_mode"] in STRUCTURED
     is_kid = p["data_mode"] == "KID"
+    is_case = p["data_mode"] == "CASE"
     tbls = tables_for(p["data_mode"])
     labels = blocks[0]["rounds"] if (blocks and is_mer) else []
     ncols = 14 if is_mer else 5
@@ -1665,7 +1806,8 @@ def _write_summary(ws, p, blocks, sheet_names):
     r += 2
     hr = r
     if is_mer:
-        headers = ["Search term", "Round", "KIDs mentioning it" if is_kid else "Total hits"] + tbls + [
+        headers = ["Search term", "Round", "KIDs mentioning it" if is_kid else
+                   "Case studies" if is_case else "Total hits"] + tbls + [
                    "Jurisdictions mentioned",
                    "Jurisdictions in scope", "Coverage %", "Jurisdictions list",
                    "Equivalent terms searched", "Restricted to",
@@ -1729,7 +1871,7 @@ def _write_matrix(ws, p, blocks):
     """Jurisdiction x term: how many paragraphs mention each term."""
     labels = blocks[0]["rounds"] if blocks else []
     df = load_struct(p)
-    unit = "KIDs" if p["data_mode"] == "KID" else "paragraphs"
+    unit = {"KID": "KIDs", "CASE": "case studies"}.get(p["data_mode"], "paragraphs")
     base_filters = dict(p.get("filters", {}) or {})
     heads = _unique(["Round", "Jurisdiction"] + [b["term"] for b in blocks]
                     + ["Terms mentioned"])
@@ -1737,6 +1879,8 @@ def _write_matrix(ws, p, blocks):
     _band(ws, 1, f"Country matrix  -  {unit} mentioning each term, per jurisdiction", ncols)
     _note(ws, 2, (f"Each number is how many of that jurisdiction's Key Issue Documents mention "
                   if unit == "KIDs" else
+                  "Each number is how many case studies (boxes) of that jurisdiction's report "
+                  "contain " if unit == "case studies" else
                   "Each number is how many paragraphs of that jurisdiction's report mention ")
               + "the term (empty = not mentioned). 'Terms mentioned' counts how many of "
                  "the searched terms appear at all. Rounds are listed separately"
@@ -1841,11 +1985,41 @@ def _kid_rows(ws, hr, b, sentence_only, idx):
         r += 1
     _add_table(ws, f"tTerm{idx}", hr, r - 1, len(heads))
 
+CASE_HEADERS = ["Round", "Reference (for citing)", "Jurisdiction", "IO", "Core issue",
+                "Indicator", "Rating", "Type", "Box title"]
+CASE_WIDTHS = [11, 40, 18, 8, 10, 34, 8, 12, 50]
+
+def _case_rows(ws, hr, b, sentence_only, idx):
+    """One row per box: where it comes from, then its full text."""
+    heads = CASE_HEADERS + ["Sentence with the term" if sentence_only else "Case study (full text)",
+                            "Term in context"]
+    _write_header(ws, hr, heads, CASE_WIDTHS + [110, 60], height=30)
+    r = hr + 1
+    for x in b["results"]:
+        _round_cell(ws.cell(row=r, column=1), x["Round"])
+        vals = [x["ref"], x["Jurisdiction"], pretty_measure(x["MEASURE"]), x.get("CoreIssue", ""),
+                x["Indicator"], x["Rating"], x.get("BoxKind", ""), x.get("BoxTitle", "")]
+        for j, v in enumerate(vals, start=2):
+            c = ws.cell(row=r, column=j)
+            _setv(c, v)
+            _style(c, "wrap", alignment=WRAP)
+        variants = x.get("variants") or x.get("matched")
+        body = x["sentence"] if sentence_only else (x.get("Lines") or x["OBS_VALUE"])
+        for j, v in ((len(CASE_HEADERS) + 1, body),
+                     (len(CASE_HEADERS) + 2, x["context"] if x.get("matched") else "")):
+            c = ws.cell(row=r, column=j)
+            _setv(c, _rich(v, variants))
+            _style(c, "wrap", alignment=WRAP)
+        r += 1
+    _add_table(ws, f"tTerm{idx}", hr, r - 1, len(heads))
+
 def _write_term_sheet(ws, p, b, idx):
     is_mer = p["data_mode"] in STRUCTURED
     is_kid = p["data_mode"] == "KID"
+    is_case = p["data_mode"] == "CASE"
     sentence_only = p.get("quote_style") == "sentence"
-    ncols = (len(KID_HEADERS) + 5 if is_kid else len(MER_HEADERS)) if is_mer else 6
+    ncols = (len(KID_HEADERS) + 5 if is_kid else len(CASE_HEADERS) + 2 if is_case
+             else len(MER_HEADERS)) if is_mer else 6
     _band(ws, 1, f'"{b["term"]}"', ncols, size=14)
     info = []
     if len(b.get("aliases") or []) > 1:
@@ -1877,8 +2051,8 @@ def _write_term_sheet(ws, p, b, idx):
         if not rows:
             _setv(ws.cell(row=hr, column=1), "No mentions found.")
             return
-        if is_kid:
-            _kid_rows(ws, hr, b, sentence_only, idx)
+        if is_kid or is_case:
+            (_kid_rows if is_kid else _case_rows)(ws, hr, b, sentence_only, idx)
             ws.freeze_panes = ws.cell(row=hr + 1, column=3)
             return
         heads = list(MER_HEADERS)
@@ -1936,7 +2110,12 @@ def _write_term_sheet(ws, p, b, idx):
 def _write_all_hits(ws, p, blocks):
     is_mer = p["data_mode"] in STRUCTURED
     is_kid = p["data_mode"] == "KID"
-    if is_kid:
+    is_case = p["data_mode"] == "CASE"
+    if is_case:
+        heads = ["Search term", "Round", "Reference (for citing)", "Jurisdiction", "IO",
+                 "Core issue", "Indicator", "Rating", "Type", "Box title", "Matched as"]
+        widths = [26, 11, 40, 18, 8, 10, 34, 8, 12, 50, 18]
+    elif is_kid:
         heads = ["Search term", "Round", "KID", "Reference (for citing)", "Jurisdiction",
                  "IO / Recommendation", "Theme", "Plenary", "Plenary outcome",
                  "Final rating", "Term found in", "Matched as", "Sentences with the term"]
@@ -1953,6 +2132,7 @@ def _write_all_hits(ws, p, blocks):
     _band(ws, 1, "All hits  -  every hit for every term, one row each", len(heads))
     _note(ws, 2, "One flat table for filtering, sorting and pivot tables. "
                  + ("Each KID's full text is on each term's own sheet." if is_kid else
+                    "Each case study's full text is on each term's own sheet." if is_case else
                     "Full paragraphs are on each term's own sheet."), len(heads), italic=True)
     hr = 4
     _write_header(ws, hr, heads, widths, height=30)
@@ -1960,7 +2140,11 @@ def _write_all_hits(ws, p, blocks):
     for b in blocks:
         rows = b["results"] if is_mer else [x for fb in b["results"] for x in fb["rows"]]
         for x in rows:
-            if is_kid:
+            if is_case:
+                vals = [b["term"], None, x["ref"], x["Jurisdiction"], pretty_measure(x["MEASURE"]),
+                        x.get("CoreIssue", ""), x["Indicator"], x["Rating"], x.get("BoxKind", ""),
+                        x.get("BoxTitle", ""), ", ".join(v for v in (x.get("variants") or []) if v)]
+            elif is_kid:
                 vals = [b["term"], None, kid_short(x["KID"]), x["ref"], x["Jurisdiction"],
                         x["Indicator"], x["Theme"], plenary_label(x["Plenary"]), x["Outcome"],
                         x["Rating"], ", ".join(x.get("matched_parts") or []),
@@ -2228,6 +2412,35 @@ def _kid_word(x, lab, sentence_only):
                      after=120))
     return out
 
+def _units(n, unit):
+    return {"case study": "case study" if n == 1 else "case studies"}.get(
+        unit, unit + ("" if n == 1 else "s"))
+
+def _case_word(x, lab, sentence_only):
+    """One case study in the Word report: where it comes from, then the box."""
+    head = pretty_measure(x["MEASURE"])
+    if x.get("CoreIssue"):
+        head += "  ·  core issue " + x["CoreIssue"]
+    if x.get("Rating") and x["Rating"] != "NA":
+        head += "  ·  rated " + x["Rating"]
+    out = [_para([_round_tag(lab), _run(head, size="18", color="2C5F8A", bold=True)],
+                 after=30, before=150)]
+    if x.get("BoxTitle"):
+        out.append(_para([_run(x["BoxTitle"], bold=True, size="21", color="1E2F4D")], after=50))
+    if sentence_only and x.get("matched"):
+        out.append(_para(_highlight_runs(x["sentence"], x.get("variants")),
+                         after=110, shade="F6EBE1"))
+    else:
+        lines = (x.get("Lines") or x["OBS_VALUE"]).split("\n")
+        if lines and lines[0].strip() == (x.get("BoxTitle") or "").strip():
+            lines = lines[1:]
+        for line in lines:
+            out.append(_para(_highlight_runs(line, x.get("variants"), base_size="20"),
+                             after=40, shade="F6EBE1"))
+    out.append(_para([_run("Reference: " + x["ref"], italic=True, size="16", color="54677F")],
+                     after=120))
+    return out
+
 def build_word_report(p, blocks, export_dir):
     os.makedirs(export_dir, exist_ok=True)
     path = _free_path(export_dir, export_filename(p, blocks, "docx"))
@@ -2237,8 +2450,9 @@ def build_word_report(p, blocks, export_dir):
     today = datetime.now().strftime("%d %B %Y")
     is_mer = p["data_mode"] in STRUCTURED
     is_kid = p["data_mode"] == "KID"
+    is_case = p["data_mode"] == "CASE"
     tbls = tables_for(p["data_mode"])
-    unit = "KID" if is_kid else "mention"
+    unit = "KID" if is_kid else "case study" if is_case else "mention"
     labels = blocks[0]["rounds"] if (blocks and is_mer) else []
     two = len(labels) == 2
     sentence_only = (p.get("quote_style") == "sentence")
@@ -2248,7 +2462,9 @@ def build_word_report(p, blocks, export_dir):
     B.append(_para([_run("FATF SEARCH TOOL", bold=True, color="2C5F8A", size="19")], after=60))
     B.append(_para([_run(title, bold=True, color="1E2F4D", size="44")], after=80))
     B.append(_para([_run(("Key Issue Documents that mention the terms, " + src_label.split(", ")[-1]
-                          if is_kid else "Mentions in " + src_label.replace("MER ", "")
+                          if is_kid else
+                          "Case studies from the effectiveness chapters of the MERs, "
+                          + src_label.split(", ")[-1] if is_case else "Mentions in " + src_label.replace("MER ", "")
                          + (" Mutual Evaluation Reports" if is_mer else ""))
                          + ", with context and statistics",
                          italic=True, color="54677F", size="23")], after=200, border=True))
@@ -2260,8 +2476,8 @@ def build_word_report(p, blocks, export_dir):
             tot = int(apply_filters(df_all[df_all["Round"] == lab], gf)["Jurisdiction"].nunique())
             n = sum(1 for b in blocks for x in b["results"] if x["Round"] == lab)
             cover.append([(lab[0].upper() + lab[1:], True),
-                          "%d %s%s  ·  %d jurisdictions %s" %
-                          (n, unit, "" if n == 1 else "s", tot,
+                          "%d %s  ·  %d jurisdictions %s" %
+                          (n, _units(n, unit), tot,
                            "with KIDs" if is_kid else "assessed")])
     else:
         cover.append([("Total mentions", True), str(sum(_count(b) for b in blocks))])
@@ -2370,7 +2586,8 @@ def build_word_report(p, blocks, export_dir):
                      "Risk and Context": "In risk and context",
                      "Technical Compliance": "In technical compliance" + (" KIDs" if is_kid else ""),
                      "General": "In general KIDs (no IO or R)"}
-            names = (["KIDs mentioning it" if is_kid else "Mentions", "Countries mentioning it"]
+            names = (["KIDs mentioning it" if is_kid else "Case studies" if is_case else "Mentions",
+                      "Countries mentioning it"]
                      + [tname[t] for t in tbls]
                      + ["Comes up most under",
                         "Final ratings after the Plenary" if is_kid else "Ratings on those paragraphs",
@@ -2411,15 +2628,14 @@ def build_word_report(p, blocks, export_dir):
                     bycountry[x["Jurisdiction"]].append(x)
                 for country in sorted(bycountry):
                     items = bycountry[country]
-                    if is_kid:
+                    if is_kid or is_case:
                         B.append(_para([_run(country + "  ", bold=True, size="22"),
-                                        _run("(%d KID%s%s)" % (len(items),
-                                             "s" if len(items) > 1 else "",
+                                        _run("(%d %s%s)" % (len(items), _units(len(items), unit),
                                              ", " + lab if two else ""),
                                              size="19", color="54677F")],
                                        style="Heading3", before=180, after=70))
                         for x in items:
-                            B.extend(_kid_word(x, lab, sentence_only))
+                            B.extend((_kid_word if is_kid else _case_word)(x, lab, sentence_only))
                         continue
                     B.append(_para([_run(country + "  ", bold=True, size="22"),
                                     _run("(%d mention%s%s)" % (len(items),
@@ -2620,6 +2836,13 @@ def kid_facets(df):
             "outc": {"tree": [{"id": "all", "name": "", "items": outs}], "presets": []},
             "plen": kid_plenary_facet(df), "rat": rating_facet(df)}
 
+def case_facets(df):
+    kinds = [k for k in ("Case study", "Other box") if k in set(df["BoxKind"])]
+    return {"jur": jurisdiction_facet(df), "ind": indicator_facet(df),
+            "rat": rating_facet(df),
+            "kind": {"tree": [{"id": "all", "name": "", "items": kinds}], "presets": [],
+                     "default": ["Case study"] if "Case study" in kinds else kinds}}
+
 def _err(e):
     return jsonify({"ok": False, "error": f"{e}", "trace": traceback.format_exc()})
 
@@ -2628,6 +2851,21 @@ def api_load():
     try:
         p = request.get_json(force=True)
         set_paths(p.get("paths"))
+        if p["data_mode"] == "CASE":
+            df = load_cases(p["round"])
+            per = []
+            for r in rounds_of(p["round"]):
+                d = df[df["Round"] == ROUND_LABEL[r]]
+                per.append({"round": ROUND_LABEL[r], "rows": int(len(d)),
+                            "n_jurisdictions": int(d["Jurisdiction"].nunique()),
+                            "counts": {{"Case study": "Case studies", "Other box": "Other boxes"}.get(k, k): int(v) for k, v in
+                                       d["BoxKind"].value_counts().items()}})
+            return jsonify({
+                "ok": True, "rounds": per, "unit": "CASE",
+                "total": int(len(df)),
+                "n_jurisdictions": int(df["Jurisdiction"].nunique()),
+                "facets": case_facets(df),
+                "labels": {c: rating_option(c) for c in set(df["Rating"].unique()) if c}})
         if p["data_mode"] == "KID":
             df = load_kid(p["round"])
             per = []
@@ -3366,6 +3604,8 @@ li.hit .stepbody{background:color-mix(in srgb,var(--accent-soft) 45%,var(--surfa
           <span><b>Mutual evaluations</b><span class="d">Every paragraph of the MERs: effectiveness, risk and context, technical compliance</span></span></button>
         <button class="srcopt" data-v="KID" role="radio" onclick="setMode('KID')"><span class="radio"></span>
           <span><b>Key issues</b><span class="d">Key Issue Documents: what was debated at Plenary and what was decided</span></span></button>
+        <button class="srcopt" data-v="CASE" role="radio" onclick="setMode('CASE')"><span class="radio"></span>
+          <span><b>Case studies</b><span class="d">The case study boxes in the MER effectiveness chapters, both rounds. Search words, or filter and list them all</span></span></button>
         <button class="srcopt" data-v="OTHER" role="radio" onclick="setMode('OTHER')"><span class="radio"></span>
           <span><b>Other files</b><span class="d">Your own Word, PDF, Excel, CSV and text files</span></span></button>
       </div>
@@ -3546,6 +3786,7 @@ const RSHORT={'4th round':'4th','5th round':'5th'};
 const INTRO={
   MER:'Searches every paragraph of the mutual evaluation reports. Each hit opens to the paragraph as it appears in the report, tables and boxes included.',
   KID:'Searches the Key Issue Documents: the key issue, the ECG discussion and proposal, and the Plenary discussion and decision. Each hit is one KID, and opens to the full record.',
+  CASE:'Searches the case study boxes in the effectiveness chapters of the MERs. Type words to narrow them down, or leave the box empty and press Search to list every case study that matches your filters.',
   OTHER:'Searches your own files in the "other" folder, and shows exactly where each hit is.'};
 function welcomeHtml(){
   return '<div class="welcome"><h2>Your results will appear here</h2><p>'+INTRO[dataMode]+'</p>'
@@ -3559,10 +3800,11 @@ async function post(url,body){
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   return r.json();
 }
-function plural(n,w){return n.toLocaleString()+' '+w+(n===1?'':'s');}
+const PLURALS={'case study':'case studies'};
+function plural(n,w){return n.toLocaleString()+' '+(n===1?w:(PLURALS[w]||w+'s'));}
 function fileNamePreview(){
   const n=($('reportName').value||'').trim();
-  const t=($('terms').value.split('\n').map(x=>x.trim()).filter(Boolean)[0]||'search');
+  const t=($('terms').value.split('\n').map(x=>x.trim()).filter(Boolean)[0]||(dataMode==='CASE'?'All case studies':'search'));
   const d=new Date(); const ds=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
   $('fileNamePreview').innerHTML='Saves as '+esc(ds+'_'+(n||t)+'_FATF Search tool')+'.xlsx / .docx. '
     +'<button class="linkbtn" onclick="openFolder()">Open export folder</button>';
@@ -3577,13 +3819,17 @@ function applyModeUI(){
   $('roundWrap').style.display=st?'':'none';
   $('filterCard').style.display=st?'':'none';
   $('modeIntro').textContent=INTRO[dataMode];
-  $('qsFull').textContent=dataMode==='KID'?'Quotes: the whole KID (all five parts)':'Quotes: full paragraph';
+  $('qsFull').textContent=dataMode==='KID'?'Quotes: the whole KID (all five parts)':
+    dataMode==='CASE'?'Quotes: the whole case study':'Quotes: full paragraph';
   initFacets();roundHint();
   if(!lastPayload)$('results').innerHTML=welcomeHtml();}
-function setMode(v){if(v===dataMode)return;dataMode=v;applyModeUI();loaded=false;setChip(null);loadData();}
+function setMode(v){if(v===dataMode)return;dataMode=v;
+  if(v==='CASE'&&round!=='both'){round='both';segSet('roundSeg','both');}
+  applyModeUI();loaded=false;setChip(null);countTerms();fileNamePreview();loadData();}
 function setRound(v){if(v===round&&loaded)return;round=v;segSet('roundSeg',v);roundHint();loaded=false;setChip(null);loadData();}
 function roundHint(){
-  const h=dataMode==='KID'?{'4':'Key issues from 4th round evaluations.','5':'Key issues from 5th round evaluations so far.',
+  const h=dataMode==='CASE'?{'4':'Case studies from 4th round reports.','5':'Case studies from 5th round reports so far.',
+    'both':'Both rounds together. Every case study is labelled with its round, country, IO, core issue and rating.'}:dataMode==='KID'?{'4':'Key issues from 4th round evaluations.','5':'Key issues from 5th round evaluations so far.',
     'both':'Both rounds together. Every KID is labelled with its round, and statistics are shown per round, never added together.'}:{'4':'4th round reports (2013 Methodology).','5':'5th round reports (2022 Methodology) published so far.',
     'both':'Both rounds searched together. Every hit is labelled with its round, and every statistic is shown per round, never added together.'};
   $('roundHint').textContent=h[round]||'';}
@@ -3629,12 +3875,18 @@ const FDEFS={
     {k:'part', fk:'parts', title:'Where to look in the KID', noun:'part', ph:'Find a part'},
     {k:'outc', fk:'outcomes', title:'Plenary decision', noun:'decision', ph:'Find a decision'},
     {k:'plen', fk:'plenaries', title:'Plenary meeting', noun:'Plenary meeting', ph:'Find a year or month, e.g. 2019'},
-    {k:'rat', fk:'ratings', title:'Final rating', noun:'rating', ph:'Find a rating'}]};
+    {k:'rat', fk:'ratings', title:'Final rating', noun:'rating', ph:'Find a rating'}],
+  CASE:[
+    {k:'kind', fk:'boxkinds', title:'Type of box', noun:'box type', ph:'Find a type'},
+    {k:'jur', fk:'jurisdictions', title:'Jurisdictions', noun:'jurisdiction', ph:'Find a jurisdiction'},
+    {k:'ind', fk:'indicators', title:'IOs and core issues', noun:'core issue', ph:'Find an IO or core issue, e.g. IO.6'},
+    {k:'rat', fk:'ratings', title:'Effectiveness rating', noun:'rating', ph:'Find a rating'}]};
 const TDEFS={
   MER:[{id:'tEff',v:'Effectiveness',t:'Effectiveness',c:'--eff'},{id:'tRC',v:'Risk and Context',t:'Risk and context',c:'--rc'},
        {id:'tTC',v:'Technical Compliance',t:'Technical compliance',c:'--tc'}],
   KID:[{id:'tEff',v:'Effectiveness',t:'Effectiveness (IOs)',c:'--eff'},{id:'tTC',v:'Technical Compliance',t:'Technical compliance (Rs)',c:'--tc'},
-       {id:'tGen',v:'General',t:'General',c:'--gen'}]};
+       {id:'tGen',v:'General',t:'General',c:'--gen'}],
+  CASE:[]};
 let FDEF=[], TDEF=[];
 const F={};
 let LABELS={}, curTab='jur', gseq=0;
@@ -3658,7 +3910,8 @@ function setFacet(k,data){
     f.gidx[n._g]=its;return its;};
   f.tree.forEach(walk);
   f.values=[...new Set(vals)];
-  if(wasAll)f.sel=new Set(f.values);
+  if(wasAll&&data&&data.default&&!f.touched)f.sel=new Set(data.default.filter(v=>f.values.includes(v)));
+  else if(wasAll)f.sel=new Set(f.values);
   else{f.sel=new Set(f.values.filter(v=>f.sel.has(v)));if(!f.sel.size)f.sel=new Set(f.values);}
 }
 function facetVals(k){const f=F[k];return (!f.values.length||f.sel.size===f.values.length)?[]:[...f.sel];}
@@ -3723,6 +3976,7 @@ function buildRail(){
 function bindList(el){
   el.addEventListener('change',e=>{
     const t=e.target;const k=el.dataset.f;const f=F[k];if(!f||t.type!=='checkbox')return;
+    f.touched=true;
     if(t.dataset.v!==undefined){t.checked?f.sel.add(t.dataset.v):f.sel.delete(t.dataset.v);}
     else if(t.dataset.g){const its=f.gidx[t.dataset.g]||[];
       const allOn=its.every(v=>f.sel.has(v));its.forEach(v=>allOn?f.sel.delete(v):f.sel.add(v));}
@@ -3810,7 +4064,7 @@ async function loadData(){
     if(!j.ok){st.textContent='Could not load: '+j.error;st.classList.add('err');loaded=false;return;}
     loaded=true;loadedKey=key;
     if(dataMode!=='OTHER'){
-      const unit=j.unit==='KID'?'KIDs':'paragraphs';
+      const unit=j.unit==='KID'?'KIDs':j.unit==='CASE'?'boxes':'paragraphs';
       st.classList.add('ok');
       st.textContent=(j.file?'Loaded '+j.file+'\n':'')+j.rounds.map(r=>r.round+': '+r.rows.toLocaleString()+' '+unit+', '
         +r.n_jurisdictions+' jurisdictions\n'
@@ -3822,7 +4076,7 @@ async function loadData(){
       FDEF.forEach(d=>setFacet(d.k,fx[d.k]));
       refreshAll();
       if($('fdlg').open)showTab(curTab);
-      const src=dataMode==='KID'?'Key issues':'Mutual evaluations';
+      const src=dataMode==='KID'?'Key issues':dataMode==='CASE'?'Case studies':'Mutual evaluations';
       if(j.rounds.length===2)
         setChip(src+', 4th and 5th rounds, '+j.total.toLocaleString()+' '+unit);
       else setChip(src+', '+j.rounds[0].round+', '+j.n_jurisdictions+' jurisdictions, '+j.total.toLocaleString()+' '+unit);
@@ -3851,7 +4105,7 @@ function payload(){
 function filterProblem(){
   if(dataMode==='OTHER')return null;
   for(const d of FDEF){const f=F[d.k];if(f.values.length&&!f.sel.size)return {k:d.k,msg:'No '+d.noun+'s are selected. Tick at least one, or select all.'};}
-  if(!tablesOn().length)return {k:curTab,msg:'No tables are selected. Turn on at least one of '+TDEF.map(t=>t.t).join(', ')+'.'};
+  if(TDEF.length&&!tablesOn().length)return {k:curTab,msg:'No tables are selected. Turn on at least one of '+TDEF.map(t=>t.t).join(', ')+'.'};
   return null;}
 
 /* =====================================================================
@@ -3976,7 +4230,7 @@ async function doSearch(){
   if(!loaded||loadedKey!==dataMode+'|'+round+'|'+JSON.stringify(paths())){await loadData();if(!loaded)return;}
   const p=payload();
   const ss=$('searchStatus');ss.classList.remove('err');ss.textContent='';
-  if(p.terms.length===0){ss.textContent='Enter at least one search term.';ss.classList.add('err');$('terms').focus();return;}
+  if(p.terms.length===0&&dataMode!=='CASE'){ss.textContent='Enter at least one search term.';ss.classList.add('err');$('terms').focus();return;}
   const fp=filterProblem();
   if(fp){ss.textContent=fp.msg;ss.classList.add('err');openFilters(fp.k);return;}
   p.sid=newSid();
@@ -3991,7 +4245,7 @@ async function doSearch(){
     saveHist(p);
     renderResults(j);
     const tot=j.results.reduce((a,b)=>a+b.total,0);
-    let msg='Found '+plural(tot,j.data_mode==='KID'?'KID':'hit')+' across '+plural(j.results.length,'term')+'.';
+    let msg='Found '+plural(tot,unitOf())+' across '+plural(j.results.length,'term')+'.';
     if(j.rounds.length===2){
       const r4=j.results.reduce((a,b)=>a+(b.by_round['4th round']||0),0),r5=j.results.reduce((a,b)=>a+(b.by_round['5th round']||0),0);
       msg+=' 4th round: '+r4.toLocaleString()+'. 5th round: '+r5.toLocaleString()+'.';
@@ -4107,11 +4361,14 @@ function setCardRound(bi,lab){
   const b=lastResults[bi];
   b.sections.forEach((s,si)=>{$('cnt'+bi+'_'+si).textContent=secCount(s,lab,true);loadSection(bi,si,false,PAGE);});
 }
-function unitOf(){return lastMode==='KID'?'KID':'hit';}
+function unitOf(){return lastMode==='KID'?'KID':lastMode==='CASE'?'case study':'hit';}
 function tableShell(two,kind){
   if(kind==='KID')return '<table class="results"><colgroup>'+(two?'<col style="width:56px">':'')
       +'<col style="width:13%"><col style="width:104px"><col style="width:20%"><col style="width:128px"><col><col style="width:68px"></colgroup>'
       +'<thead><tr>'+(two?'<th>Round</th>':'')+'<th>Jurisdiction</th><th>KID</th><th>IO or Recommendation, theme</th><th>Plenary decision</th><th>Where the term appears</th><th><span class="sr">Actions</span></th></tr></thead><tbody></tbody></table>';
+  if(kind==='CASE')return '<table class="results"><colgroup>'+(two?'<col style="width:56px">':'')
+      +'<col style="width:13%"><col style="width:20%"><col style="width:76px"><col><col style="width:68px"></colgroup>'
+      +'<thead><tr>'+(two?'<th>Round</th>':'')+'<th>Jurisdiction</th><th>IO and core issue</th><th>Rating</th><th>Case study</th><th><span class="sr">Actions</span></th></tr></thead><tbody></tbody></table>';
   if(kind==='MER')return '<table class="results"><colgroup>'+(two?'<col style="width:56px">':'')
       +'<col style="width:13%"><col style="width:84px"><col style="width:17%"><col style="width:76px"><col><col style="width:68px"></colgroup>'
       +'<thead><tr>'+(two?'<th>Round</th>':'')+'<th>Jurisdiction</th><th>Measure</th><th>Indicator</th><th>Rating</th><th>Term in context</th><th><span class="sr">Actions</span></th></tr></thead><tbody></tbody></table>';
@@ -4142,6 +4399,18 @@ function rowHtml(x,two,kind){
       +'<div class="rowtools"><button class="readbtn" aria-expanded="false" onclick="toggleDoc(this,\''+x._id+'\')">Open KID</button>'
       +'<span class="smallmeta" style="display:inline;margin:0 2px 0 4px">Found in</span>'
       +(x.matched_parts||[]).map(n=>'<span class="parttag">'+esc(n)+'</span>').join('')+'</div></td>'+actions(x._id)+'</tr>';
+  }
+  if(kind==='CASE'){
+    const io=(x.MEASURE||'').replace(/^IO(\d+).*/,'IO.$1');
+    return '<tr class="hit'+cls+'" data-id="'+x._id+'">'+(two?'<td>'+rtag(x.Round)+'</td>':'')
+      +'<td class="jur">'+esc(x.Jurisdiction)+'</td>'
+      +'<td><b>'+esc(io)+(x.CoreIssue?', core issue '+esc(x.CoreIssue):'')+'</b><span class="smallmeta">'+esc(x.Indicator)+'</span></td>'
+      +'<td>'+(x.Rating==='NA'?'<span class="pill na">NA</span>':pill(x.Rating))+'</td>'
+      +'<td class="ctx"><b>'+hl(x.BoxTitle||'',x.matched,x.variants)+'</b>'
+      +(x.BoxKind&&x.BoxKind!=='Case study'?' <span class="fmt">'+esc(x.BoxKind)+'</span>':'')
+      +'<div>'+hl(x.matched?x.context:(x.context||'').replace(x.BoxTitle||'','').trim(),x.matched,x.variants)+'</div>'
+      +'<div class="rowtools"><button class="readbtn" aria-expanded="false" onclick="toggleDoc(this,\''+x._id+'\')">Open case study</button></div></td>'
+      +actions(x._id)+'</tr>';
   }
   if(kind==='MER'){
     const crit=(x['Criteria rating']&&x['Criteria rating']!=='NA')?'<br>'+pill(x['Criteria rating']):'';
@@ -4192,14 +4461,14 @@ function docNode(x,color){
 }
 function toggleDoc(btn,id){
   const tr=btn.closest('tr');const nx=tr.nextElementSibling;
-  const isKid=!!(rowCache[id]&&rowCache[id].parts);
-  if(nx&&nx.classList.contains('docrow')&&nx.dataset.for===id){nx.remove();btn.setAttribute('aria-expanded','false');btn.textContent=isKid?'Open KID':'Read paragraph';return;}
+  const isKid=!!(rowCache[id]&&rowCache[id].parts);const what=isKid?'KID':lastMode==='CASE'?'case study':'paragraph';
+  if(nx&&nx.classList.contains('docrow')&&nx.dataset.for===id){nx.remove();btn.setAttribute('aria-expanded','false');btn.textContent=(isKid||lastMode==='CASE'?'Open ':'Read ')+what;return;}
   const x=rowCache[id];if(!x)return;
   const row=document.createElement('tr');row.className='docrow';row.dataset.for=id;
   const td=document.createElement('td');td.colSpan=tr.children.length;
   const sec=tr.closest('.tblsec');const color=sec?getComputedStyle(sec).getPropertyValue('--c')||'var(--accent)':'var(--accent)';
   td.appendChild(docNode(x,color));row.appendChild(td);tr.after(row);
-  btn.setAttribute('aria-expanded','true');btn.textContent=isKid?'Close KID':'Close paragraph';
+  btn.setAttribute('aria-expanded','true');btn.textContent='Close '+what;
 }
 
 async function loadSection(bi,si,append,limit){
@@ -4304,11 +4573,11 @@ function saveHist(p){
   histSet(h.slice(0,25));renderHist();}
 function histSrc(x){if(x.mode==='OTHER')return 'Other files';
   const r=x.round==='both'?'both rounds':(x.round==='4'?'4th round':(x.round==='5'?'5th round':''));
-  return (x.mode==='KID'?'Key issues, ':'MER, ')+r;}
+  return (x.mode==='KID'?'Key issues, ':x.mode==='CASE'?'Case studies, ':'MER, ')+r;}
 function renderHist(){
   const h=histGet();const el=$('hist');
   if(!h.length){el.innerHTML='<div class="empty">No searches yet.</div>';return;}
-  el.innerHTML=h.map((x,i)=>'<a onclick="reuse('+i+')" title="'+esc(x.when)+'"><small>'+esc(histSrc(x))+'</small>'+esc(x.t.join(', '))+'</a>').join('');}
+  el.innerHTML=h.map((x,i)=>'<a onclick="reuse('+i+')" title="'+esc(x.when)+'"><small>'+esc(histSrc(x))+'</small>'+esc(x.t.join(', ')||'all, by filters')+'</a>').join('');}
 async function reuse(i){const x=histGet()[i];if(!x)return;
   $('terms').value=x.t.join('\n');countTerms();fileNamePreview();
   if(x.sm)setSM(x.sm);
@@ -4319,7 +4588,7 @@ async function reuse(i){const x=histGet()[i];if(!x)return;
   window.scrollTo({top:0});}
 function countTerms(){
   const n=$('terms').value.split('\n').map(t=>t.trim()).filter(Boolean).length;
-  $('termCount').textContent=n?plural(n,'term'):'No terms yet';}
+  $('termCount').textContent=n?plural(n,'term'):(dataMode==='CASE'?'No words: Search lists every case study matching the filters':'No terms yet');}
 
 $('terms').addEventListener('input',()=>{countTerms();fileNamePreview();});
 $('terms').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();doSearch();}});
