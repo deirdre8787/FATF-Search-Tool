@@ -198,6 +198,8 @@ class _Sanitiser(HTMLParser):
             styles.append(f"vertical-align:{a['valign'].lower()}")
         if a.get("bgcolor"):
             classes.append("shaded")
+        if re.search(r"box|frame|callout|sidebar", a.get("class", ""), re.I):
+            classes.append("boxed")
         for decl in a.get("style", "").split(";"):
             if ":" not in decl:
                 continue
@@ -309,7 +311,7 @@ def rating_option(code):
 # DATA LOADING (cached in memory, and on disk so restarts are fast)
 # =============================================================================
 _CACHE = {}   # keys: "mer4", "mer5", "merboth", "other"
-LOADER_VERSION = "9.0"
+LOADER_VERSION = "9.2"
 
 def _cache_dir():
     """Local (not synced) folder for the fast-restart cache."""
@@ -562,13 +564,26 @@ def load_kid(sel):
 # =============================================================================
 # MERs set case studies apart in boxes ("Box 3.2. Case example: ..."). In the
 # HTML these are single-cell tables, or blocks with shading or a border. Each
-# box becomes one record; boxes whose title mentions a case or an example are
-# case studies, the others are kept as "Other box" so nothing is lost.
+# box becomes one record. Where a report has no box markup, a paragraph that
+# starts "Box 3.1 ..." and the paragraphs after it count as a box. Boxes whose
+# title mentions a case or an example are case studies; the others are kept as
+# "Other box" (both are shown by default).
 from xml.etree import ElementTree as _ET
 
 CASE_COLS = ["BoxTitle", "BoxKind", "CoreIssue", "BoxNo", "Lines"]
 _CASE_TITLE = re.compile(r"\bcase\b|\bcases\b|\bexample|\bcase[- ]stud", re.I)
-_BOX_TITLE = re.compile(r"^\s*Box\s+[\dA-Z]+(\.\d+)*", re.I)
+_BOX_TITLE = re.compile(r"^\s*(Box\s+[\dA-Z]+(\.\d+)*|Case\s+(stud(y|ies)|examples?)\b)", re.I)
+_BOX_ANYWHERE = re.compile(r"\bBox\s+\d+(\.\d+)+\b")
+_NUMBERED_PARA = re.compile(r"^\s*\d{1,4}\.\s")
+_BLOCK_TAGS = {"p", "ul", "ol", "table", "div", "blockquote", "h4", "h5", "h6", "dl"}
+
+def _own_cells(table):
+    rows = [ch for ch in table if ch.tag == "tr"] + [
+        tr for sec in table if sec.tag in ("thead", "tbody", "tfoot") for tr in sec if tr.tag == "tr"]
+    return rows, [[c for c in tr if c.tag in ("td", "th")] for tr in rows]
+
+def _text(el):
+    return "".join(el.itertext()).strip()
 
 def _box_candidates(root):
     """Outermost elements that look like a box."""
@@ -577,17 +592,21 @@ def _box_candidates(root):
         tag = el.tag
         cls = el.get("class", "")
         if tag == "table":
-            rows = [ch for ch in el if ch.tag == "tr"] + [
-                tr for sec in el if sec.tag in ("thead", "tbody", "tfoot")
-                for tr in sec if tr.tag == "tr"]
-            cells = [c for tr in rows for c in tr if c.tag in ("td", "th")]   # not nested tables
-            if len(cells) == 1:
+            rows, cells = _own_cells(el)
+            flat = [c for r in cells for c in r]           # nested tables not counted
+            if not flat:
+                return False
+            if len(flat) == 1:
                 return True
-            if "shaded" in cls and len(cells) <= 2:
+            if all(len(r) <= 1 for r in cells) and len(rows) <= 6:
+                return True                                 # one column: title row + body rows
+            marked = "boxed" in cls or "shaded" in cls or any(
+                "boxed" in c.get("class", "") for c in flat)
+            if marked and len(flat) <= 4:
                 return True
-            txt = "".join(el.itertext()).strip()
-            return bool(_BOX_TITLE.match(txt)) and len(cells) <= 2
-        if tag in ("div", "blockquote", "p") and ("boxed" in cls or "shaded" in cls):
+            return bool(_BOX_TITLE.match(_text(el))) and len(flat) <= 4
+        if tag in ("div", "blockquote", "p", "section", "aside") and (
+                "boxed" in cls or "shaded" in cls):
             return True
         return False
     def walk(el):
@@ -599,26 +618,74 @@ def _box_candidates(root):
     walk(root)
     return found
 
-def _box_title(text):
-    first = next((ln.strip() for ln in text.split("\n") if ln.strip()), "")
+def _blocks_after_title(root):
+    """Boxes written as plain paragraphs: a block starting 'Box 3.1 ...' and
+       the blocks after it, up to the next numbered paragraph, heading or box."""
+    blocks = [ch for ch in root if ch.tag in _BLOCK_TAGS]
+    out, i = [], 0
+    while i < len(blocks):
+        if _BOX_TITLE.match(_text(blocks[i])):
+            j = i + 1
+            while j < len(blocks):
+                t = _text(blocks[j])
+                if (_BOX_TITLE.match(t) or _NUMBERED_PARA.match(t)
+                        or blocks[j].tag in ("h4", "h5", "h6")):
+                    break
+                j += 1
+            out.append(blocks[i:j])
+            i = j
+        else:
+            i += 1
+    return out
+
+def _box_title(el, lines):
+    """The bold 'Box 3.1 ...' line if there is one, else the first line."""
+    for b in el.iter():
+        if b.tag in ("b", "strong", "h4", "h5", "h6"):
+            t = re.sub(r"\s+", " ", _text(b))
+            if _BOX_TITLE.match(t):
+                return t[:240]
+    first = next((ln.strip() for ln in lines.split("\n") if ln.strip()), "")
     return first[:240]
 
-def extract_boxes(html):
+def extract_boxes(html, text=""):
     """[(title, html, lines, plain_text)] for every box in one paragraph."""
-    if not html or ("<table" not in html and "class=" not in html):
-        return []
-    xml = re.sub(r"<(br|hr|col)(\s[^>]*?)?\s*/?>", r"<\1\2/>", html)
-    try:
-        root = _ET.fromstring("<root>" + xml + "</root>")
-    except _ET.ParseError:
-        return []
     out = []
-    for el in _box_candidates(root):
-        frag = _ET.tostring(el, encoding="unicode", method="html")
-        lines = html_to_lines(frag)
-        if not lines.strip():
-            continue
-        out.append((_box_title(lines), frag, lines, strip_html(frag)))
+    if html:
+        xml = re.sub(r"<(br|hr|col)(\s[^>]*?)?\s*/?>", r"<\1\2/>", html)
+        try:
+            root = _ET.fromstring("<root>" + xml + "</root>")
+        except _ET.ParseError:
+            root = None
+        if root is not None:
+            for el in _box_candidates(root):
+                frag = _ET.tostring(el, encoding="unicode", method="html")
+                lines = html_to_lines(frag)
+                if lines.strip():
+                    out.append((_box_title(el, lines), frag, lines, strip_html(frag)))
+            if not out:
+                for group in _blocks_after_title(root):
+                    wrap = _ET.Element("div", {"class": "boxed"})
+                    for g in group:
+                        wrap.append(g)
+                    frag = _ET.tostring(wrap, encoding="unicode", method="html")
+                    lines = html_to_lines(frag)
+                    if lines.strip():
+                        out.append((_box_title(wrap, lines), frag, lines, strip_html(frag)))
+    if not out and text and _BOX_ANYWHERE.search(text):
+        # no markup at all: from each 'Box N.N' to the next one, or to the end
+        starts = [m.start() for m in _BOX_ANYWHERE.finditer(text)]
+        for k, st in enumerate(starts):
+            body = text[st:starts[k + 1] if k + 1 < len(starts) else len(text)].strip()
+            if len(body) < 40:
+                continue                      # a cross-reference ("see Box 3.1"), not a box
+            prev = text[max(0, st - 12):st].lower()
+            if re.search(r"(see|in|of|and)\s*$", prev):
+                continue
+            m = re.match(r"(Box\s+\d+(?:\.\d+)+\.?\s*.{3,180}?)(?:\.\s|$)", body)
+            title = (m.group(1) if m else body[:120]).strip()
+            frag = '<div class="boxed"><p>' + html_escape(body, quote=False) + "</p></div>"
+            out.append((title, frag, body, body))
     return out
 
 def _core_issue(measure):
@@ -626,11 +693,17 @@ def _core_issue(measure):
     return f"{m.group(1)}.{m.group(2)}" if m else ""
 
 def _build_cases(df):
-    eff = df[(df["Table"] == "Effectiveness") & (df["OBS_HTML"] != "")] \
-        if "OBS_HTML" in df.columns else df.iloc[0:0]
+    eff = df[df["Table"] == "Effectiveness"]
+    if "OBS_HTML" not in eff.columns:
+        eff = eff.assign(OBS_HTML="")
+    # only paragraphs that could hold a box are parsed
+    maybe = (eff["OBS_HTML"].str.contains("<table|class=", regex=True)
+             | eff["OBS_VALUE"].str.contains(r"\bBox\s+\d|\bCase\s+(?:stud|example)", case=False,
+                                             regex=True))
     rows = []
-    for rec in eff.to_dict("records"):
-        for no, (title, frag, lines, text) in enumerate(extract_boxes(rec["OBS_HTML"]), 1):
+    for rec in eff[maybe].to_dict("records"):
+        for no, (title, frag, lines, text) in enumerate(
+                extract_boxes(rec["OBS_HTML"], rec["OBS_VALUE"]), 1):
             r = {c: rec[c] for c in UNIFORM_COLS}
             r.update({"OBS_VALUE": text, "OBS_HTML": frag, "Lines": lines,
                       "BoxTitle": title, "BoxNo": no,
@@ -2841,7 +2914,7 @@ def case_facets(df):
     return {"jur": jurisdiction_facet(df), "ind": indicator_facet(df),
             "rat": rating_facet(df),
             "kind": {"tree": [{"id": "all", "name": "", "items": kinds}], "presets": [],
-                     "default": ["Case study"] if "Case study" in kinds else kinds}}
+                     "default": kinds}}
 
 def _err(e):
     return jsonify({"ok": False, "error": f"{e}", "trace": traceback.format_exc()})
