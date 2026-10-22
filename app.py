@@ -571,10 +571,20 @@ def load_kid(sel):
 from xml.etree import ElementTree as _ET
 
 CASE_COLS = ["BoxTitle", "BoxKind", "CoreIssue", "BoxNo", "Lines"]
-_CASE_TITLE = re.compile(r"\bcase\b|\bcases\b|\bexample|\bcase[- ]stud", re.I)
-_BOX_TITLE = re.compile(r"^\s*(Box\s+[\dA-Z]+(\.\d+)*|Case\s+(stud(y|ies)|examples?)\b)", re.I)
+_CASE_TITLE = re.compile(r"\bcase\b|\bcases\b|\bexample|\bcase[- ]stud|\boperation\b", re.I)
+TITLE_ONLY = "Title only (text missing in the data)"
+
+def _box_kind(title, text):
+    """Case study / Other box, or Title only when the box text did not
+       survive into the dataset (only its title is left)."""
+    body = text[len(title):] if text.startswith(title) else text.replace(title, "", 1)
+    if len(re.sub(r"\W+", "", body)) < 40:
+        return TITLE_ONLY
+    return "Case study" if _CASE_TITLE.search(title) else "Other box"
+_BOX_TITLE = re.compile(r"^\s*(Box\s+[\dA-Z]+(\.\d+)*|Case\s+(stud(y|ies)|examples?)\b|Case\s+\d+\b)", re.I)
 _BOX_ANYWHERE = re.compile(r"\bBox\s+\d+(\.\d+)+\b")
-_NUMBERED_PARA = re.compile(r"^\s*\d{1,4}\.\s")
+_NUMBERED_PARA = re.compile(r"^\s*\d{1,4}(\.\d{1,3})*\.\s")      # "487. " or "2.23. "
+_BOX_ENDS = re.compile(r"^\s*(\[\d+\]|(Table|Figure|Chart|Graph)\s+\d)", re.I)  # footnotes, captions
 _BLOCK_TAGS = {"p", "ul", "ol", "table", "div", "blockquote", "h4", "h5", "h6", "dl"}
 
 def _own_cells(table):
@@ -628,7 +638,7 @@ def _blocks_after_title(root):
             j = i + 1
             while j < len(blocks):
                 t = _text(blocks[j])
-                if (_BOX_TITLE.match(t) or _NUMBERED_PARA.match(t)
+                if (_BOX_TITLE.match(t) or _NUMBERED_PARA.match(t) or _BOX_ENDS.match(t)
                         or blocks[j].tag in ("h4", "h5", "h6")):
                     break
                 j += 1
@@ -672,7 +682,7 @@ def extract_boxes(html, text=""):
                     lines = html_to_lines(frag)
                     if lines.strip():
                         out.append((_box_title(wrap, lines), frag, lines, strip_html(frag)))
-    if not out and text and _BOX_ANYWHERE.search(text):
+    if not out and not html and text and _BOX_ANYWHERE.search(text):
         # no markup at all: from each 'Box N.N' to the next one, or to the end
         starts = [m.start() for m in _BOX_ANYWHERE.finditer(text)]
         for k, st in enumerate(starts):
@@ -698,7 +708,7 @@ def _build_cases(df):
         eff = eff.assign(OBS_HTML="")
     # only paragraphs that could hold a box are parsed
     maybe = (eff["OBS_HTML"].str.contains("<table|class=", regex=True)
-             | eff["OBS_VALUE"].str.contains(r"\bBox\s+\d|\bCase\s+(?:stud|example)", case=False,
+             | eff["OBS_VALUE"].str.contains(r"\bBox\s+\d|\bCase\s+(?:stud|example|\d)", case=False,
                                              regex=True))
     rows = []
     for rec in eff[maybe].to_dict("records"):
@@ -707,7 +717,7 @@ def _build_cases(df):
             r = {c: rec[c] for c in UNIFORM_COLS}
             r.update({"OBS_VALUE": text, "OBS_HTML": frag, "Lines": lines,
                       "BoxTitle": title, "BoxNo": no,
-                      "BoxKind": "Case study" if _CASE_TITLE.search(title) else "Other box",
+                      "BoxKind": _box_kind(title, text),
                       "CoreIssue": _core_issue(rec["MEASURE"])})
             rows.append(r)
     out = pd.DataFrame(rows, columns=UNIFORM_COLS + ["OBS_HTML"] + CASE_COLS)
@@ -2910,11 +2920,11 @@ def kid_facets(df):
             "plen": kid_plenary_facet(df), "rat": rating_facet(df)}
 
 def case_facets(df):
-    kinds = [k for k in ("Case study", "Other box") if k in set(df["BoxKind"])]
+    kinds = [k for k in ("Case study", "Other box", TITLE_ONLY) if k in set(df["BoxKind"])]
     return {"jur": jurisdiction_facet(df), "ind": indicator_facet(df),
             "rat": rating_facet(df),
             "kind": {"tree": [{"id": "all", "name": "", "items": kinds}], "presets": [],
-                     "default": kinds}}
+                     "default": [k for k in kinds if k != TITLE_ONLY] or kinds}}
 
 def _err(e):
     return jsonify({"ok": False, "error": f"{e}", "trace": traceback.format_exc()})
@@ -2931,7 +2941,8 @@ def api_load():
                 d = df[df["Round"] == ROUND_LABEL[r]]
                 per.append({"round": ROUND_LABEL[r], "rows": int(len(d)),
                             "n_jurisdictions": int(d["Jurisdiction"].nunique()),
-                            "counts": {{"Case study": "Case studies", "Other box": "Other boxes"}.get(k, k): int(v) for k, v in
+                            "counts": {{"Case study": "Case studies", "Other box": "Other boxes",
+                                       TITLE_ONLY: "Title only, text missing in the data"}.get(k, k): int(v) for k, v in
                                        d["BoxKind"].value_counts().items()}})
             return jsonify({
                 "ok": True, "rounds": per, "unit": "CASE",
