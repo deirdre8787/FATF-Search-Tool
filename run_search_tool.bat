@@ -16,7 +16,9 @@ if exist ".git" (
     echo Git is not installed, so the tool cannot update itself. Starting this copy.
   ) else (
     echo Checking for a newer version...
-    git pull --ff-only --quiet
+    rem schannelCheckRevoke=false: office networks often block the certificate
+    rem revocation check, which otherwise stops the update with error 0x80092012
+    git -c http.schannelCheckRevoke=false pull --ff-only --quiet
     if errorlevel 1 (
       echo Could not update ^(no internet, or files in this folder were edited^).
       echo Starting the copy you already have.
