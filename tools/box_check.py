@@ -34,7 +34,7 @@ checks = [
     ("with a border style", r"(?i)border"),
     ("with a background style", r"(?i)background"),
     ("mentioning 'Box 1.2'-style titles", r"Box\s+\d+\.\d+"),
-    ("mentioning 'case study/example'", r"(?i)case\s+(stud|example)"),
+    ("mentioning 'case study/example'", r"(?i)case\s+(?:stud|example)"),
 ]
 for label, pat in checks:
     n = int(v.str.contains(pat, regex=True).sum())
@@ -47,7 +47,7 @@ for k, n in cases["BoxKind"].value_counts().items():
 
 sample = eff[v.str.contains(r"Box\s+\d+\.\d+", regex=True)].head(3)
 if sample.empty:
-    sample = eff[v.str.contains(r"(?i)case\s+(stud|example)", regex=True)].head(3)
+    sample = eff[v.str.contains(r"(?i)case\s+(?:stud|example)", regex=True)].head(3)
 out_dir = os.path.join(os.path.dirname(HERE), "exports")
 os.makedirs(out_dir, exist_ok=True)
 out = os.path.join(out_dir, "box_sample.txt")
