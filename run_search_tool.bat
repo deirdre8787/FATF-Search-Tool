@@ -18,7 +18,8 @@ if exist ".git" (
     echo Checking for a newer version...
     rem schannelCheckRevoke=false: office networks often block the certificate
     rem revocation check, which otherwise stops the update with error 0x80092012
-    git -c http.schannelCheckRevoke=false pull --ff-only --quiet
+    rem (the revocation setting only applies when the schannel backend is named)
+    git -c http.sslBackend=schannel -c http.schannelCheckRevoke=false pull --ff-only --quiet
     if errorlevel 1 (
       echo Could not update ^(no internet, or files in this folder were edited^).
       echo Starting the copy you already have.
