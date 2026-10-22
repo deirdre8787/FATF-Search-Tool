@@ -1,11 +1,24 @@
-MER SEARCH TOOL  -  v9 (15 Oct 2026)
-====================================
+FATF SEARCH TOOL  -  v10 (22 Oct 2026)
+=====================================
 Search FATF Mutual Evaluation Reports (4th round, 5th round, or both
 together) and other documents, then export the results to Excel and Word.
 
-CHECK YOU ARE ON v9: the header in the browser says "v9 (15 Oct 2026)".
+CHECK YOU ARE ON v10: the header in the browser says "v10 (22 Oct 2026)".
 If it doesn't, close every black console window, run the .bat again and
 press Ctrl+F5 in the browser.
+
+
+WHAT IS NEW IN v10
+------------------
+* 4TH ROUND CASE STUDIES FROM THE EXTRACTED BOXES FILE. Most 4th round
+  boxes are missing from the Data Explorer text, so they now come from
+  MER_boxes_4th_round_....csv (boxes extracted from the published MER
+  PDFs). Put it in "source files\MER\round_4" next to the other two
+  CSVs; the tool finds it by "box" in the file name. Case studies then
+  shows the 4th round from that file and the 5th round from the text,
+  together. Each box shows its IO, rating, the page numbers in the MER
+  and any note from the extraction (for example "check where it ends").
+  Boxes outside the IO chapters are under "Other chapters".
 
 
 WHAT IS NEW IN v9

@@ -1,6 +1,6 @@
 # FATF Search Tool
 
-**Version 9 (15 October 2026)**
+**Version 10 (22 October 2026)**
 
 A keyword-search tool for FATF Mutual Evaluation Reports (MERs) and Key Issue Documents (KIDs). It searches the 4th round, the 5th round, or both together, and can also search your own Word, PDF and Excel documents. Results export to Excel and to a Word report, with a citation for every quote.
 
@@ -26,7 +26,8 @@ The tool runs on your own computer. Nothing is uploaded anywhere: it opens as a 
 ## What it can do
 
 - **Search the Key Issue Documents.** Each KID records an issue debated at Plenary in five parts: the key issue, the ECG discussion, the ECG proposal, the Plenary discussion and the Plenary decision. A hit is one KID; it opens to the full record as a five-step timeline with the parts that matched highlighted. Filter by jurisdiction, IO or Recommendation, theme, part of the KID, Plenary decision (upgrade, downgrade, text amendment), Plenary meeting and final rating. Exports have one row per KID with each part in its own column (Excel) and the whole KID under each country (Word).
-- **Case studies.** The case study boxes in the effectiveness chapters of the MERs, both rounds, each labelled with its round, country, IO, core issue and rating. Type words to narrow them down, or leave the search box empty and press Search to list every case study that matches the filters, ready to export in full. Boxes are found from the report's formatting (single-cell or shaded tables, bordered blocks); boxes written as plain paragraphs starting "Box 3.1 ..." are picked up too. Boxes whose text did not survive into the Data Explorer dataset (only the title is left) are labelled "Title only" and left out unless you tick them. In the 4th-round data most boxes are missing: of the numbered boxes the effectiveness text refers to, only a minority have their text in the dataset, so for complete coverage the source reports are needed. A box counts as a case study when its title mentions a case, an example or an operation; both kinds are shown by default and the "Type of box" filter separates them. If a round shows no boxes, run `python tools/box_check.py 4` (or `5`): it reports how that round's text is marked up and saves a few raw sample paragraphs to `exports/box_sample.txt`.
+- **Case studies.** For the 4th round they come from `MER_boxes_4th_round_….csv`, boxes extracted from the published MER PDFs, which goes in `source files/MER/round_4/`. Each box shows its IO, rating, page numbers in the MER and any extraction note. Without that file, and for the 5th round, boxes are found in the effectiveness text.
+  Details: The case study boxes in the effectiveness chapters of the MERs, both rounds, each labelled with its round, country, IO, core issue and rating. Type words to narrow them down, or leave the search box empty and press Search to list every case study that matches the filters, ready to export in full. Boxes are found from the report's formatting (single-cell or shaded tables, bordered blocks); boxes written as plain paragraphs starting "Box 3.1 ..." are picked up too. Boxes whose text did not survive into the Data Explorer dataset (only the title is left) are labelled "Title only" and left out unless you tick them. In the 4th-round data most boxes are missing: of the numbered boxes the effectiveness text refers to, only a minority have their text in the dataset, so for complete coverage the source reports are needed. A box counts as a case study when its title mentions a case, an example or an operation; both kinds are shown by default and the "Type of box" filter separates them. If a round shows no boxes, run `python tools/box_check.py 4` (or `5`): it reports how that round's text is marked up and saves a few raw sample paragraphs to `exports/box_sample.txt`.
 - **Search every MER paragraph** in the OECD Data Explorer datasets: Effectiveness (IO.1 to IO.11), Risk and Context (including the executive summary) and Technical Compliance (R.1 to R.40, criterion by criterion).
 - **Search the 4th round, the 5th round, or both.** In "Both rounds", every hit is tagged 4th or 5th round, and counts and coverage are always shown per round, never added together. The rounds cover different countries and use different methodologies (2013 and 2022).
 - **Read each hit as it appears in the report.** "Read paragraph" opens the full paragraph with its original formatting: tables, the shaded case-study boxes, lists, bold text and footnote marks, with the matched words highlighted. Hits that contain a table, box or list are labelled.
@@ -45,7 +46,7 @@ The tool runs on your own computer. Nothing is uploaded anywhere: it opens as a 
 3. Double-click **`run_search_tool.bat`**. The first time, it installs Flask, which the tool needs.
 4. Your browser opens at **http://127.0.0.1:5177**. Keep the black window open while you use the tool, and close it to stop.
 
-The header should say **v9 (15 Oct 2026)**. If it shows an older version, close every black window, run the .bat again and press Ctrl+F5 in the browser.
+The header should say **v10 (22 Oct 2026)**. If it shows an older version, close every black window, run the .bat again and press Ctrl+F5 in the browser.
 
 On Mac or Linux, or without the .bat file:
 
@@ -89,7 +90,7 @@ Put them here:
 ```
 source files/
   MER/
-    round_4/   <- the two 4th round CSVs
+    round_4/   <- the two 4th round CSVs, plus the boxes file (name contains "box")
     round_5/   <- the two 5th round CSVs
   KID/         <- the Key Issue Documents CSV (name contains KID)
   other/       <- your own Word / PDF / Excel / CSV / text files

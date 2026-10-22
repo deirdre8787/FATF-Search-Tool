@@ -1,5 +1,5 @@
 """
-FATF Mutual Evaluation Search Tool  (v9)
+FATF Mutual Evaluation Search Tool  (v10)
 ========================================
 Local web app. Run:  python app.py   (or double-click run_search_tool.bat)
 Opens automatically in your browser at http://127.0.0.1:5177
@@ -68,7 +68,7 @@ KID_DIR     = os.path.join(BASE_DIR, "source files", "KID")
 OTHER_DIR   = os.path.join(BASE_DIR, "source files", "other")
 DEFAULT_EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 
-VERSION = "v9  (15 Oct 2026)"
+VERSION = "v10  (22 Oct 2026)"
 
 CONTEXT_CHARS = 250          # characters before/after detected term
 PAGE_SIZE     = 25           # rows fetched per "show more" click in the browser
@@ -77,7 +77,7 @@ PORT          = 5177
 ROUND_LABEL = {"4": "4th round", "5": "5th round"}
 TABLES = ["Effectiveness", "Risk and Context", "Technical Compliance"]
 KID_TABLES = ["Effectiveness", "Technical Compliance", "General"]
-CASE_TABLES = ["Effectiveness"]
+CASE_TABLES = ["Effectiveness", "Other chapters"]
 STRUCTURED = ("MER", "KID", "CASE")   # sources with rounds, jurisdictions and ratings
 
 def tables_for(mode):
@@ -119,6 +119,8 @@ def set_paths(p):
             _CACHE.pop({"round_4": "mer4", "round_5": "mer5", "kid": "kid",
                         "other": "other"}[k], None)
             _CACHE.pop("merboth", None)
+            _CACHE.pop("case4", None)
+            _CACHE.pop("case5", None)
 
 app = Flask(__name__)
 
@@ -570,7 +572,7 @@ def load_kid(sel):
 # "Other box" (both are shown by default).
 from xml.etree import ElementTree as _ET
 
-CASE_COLS = ["BoxTitle", "BoxKind", "CoreIssue", "BoxNo", "Lines"]
+CASE_COLS = ["BoxTitle", "BoxKind", "CoreIssue", "BoxNo", "Lines", "Source", "Pages", "Note"]
 _CASE_TITLE = re.compile(r"\bcase\b|\bcases\b|\bexample|\bcase[- ]stud|\boperation\b", re.I)
 TITLE_ONLY = "Title only (text missing in the data)"
 
@@ -717,14 +719,112 @@ def _build_cases(df):
             r = {c: rec[c] for c in UNIFORM_COLS}
             r.update({"OBS_VALUE": text, "OBS_HTML": frag, "Lines": lines,
                       "BoxTitle": title, "BoxNo": no,
-                      "BoxKind": _box_kind(title, text),
+                      "BoxKind": _box_kind(title, text), "Source": "", "Pages": "", "Note": "",
                       "CoreIssue": _core_issue(rec["MEASURE"])})
             rows.append(r)
     out = pd.DataFrame(rows, columns=UNIFORM_COLS + ["OBS_HTML"] + CASE_COLS)
     out["_norm"] = [norm_text(t) for t in out["OBS_VALUE"].tolist()]
     return out
 
+# A round's boxes can also come from a separate file of boxes extracted from
+# the published MER PDFs (columns as in OECD Data Explorer, plus BOX_LABEL,
+# BOX_NUMBER, BOX_TITLE, IMMEDIATE_OUTCOME, MER_CHAPTER, PDF_PAGE_START/END,
+# SOURCE_PDF, EXTRACTION_NOTE). Put it in the round's folder with "box" in
+# its name. When it is there, it replaces the boxes found in the text.
+IO_NAMES = {1: "Risk, policy and coordination", 2: "International cooperation",
+            3: "Supervision", 4: "Preventive measures", 5: "Legal persons and arrangements",
+            6: "Financial intelligence", 7: "ML investigation and prosecution",
+            8: "Confiscation", 9: "TF investigation and prosecution",
+            10: "TF preventive measures and financial sanctions",
+            11: "PF financial sanctions"}
+
+def box_file(rn):
+    folder = PATHS["round_" + rn]
+    if not os.path.isdir(folder):
+        return None
+    for f in sorted(os.listdir(folder)):
+        low = f.lower()
+        if low.endswith(".csv") and "box" in low:
+            return os.path.join(folder, f)
+    return None
+
+def _io_ratings(rn):
+    """{(jurisdiction, 'IO6'): 'ME'} from the round's MER text, if it loads."""
+    try:
+        df = load_round(rn)
+    except Exception:
+        return {}
+    eff = df[df["Table"] == "Effectiveness"]
+    out = {}
+    for j, m, r in zip(eff["Jurisdiction"], eff["MEASURE"], eff["Rating"]):
+        mm = re.match(r"IO(\d+)", str(m))
+        if mm and r and r != "NA":
+            out.setdefault((j, "IO" + mm.group(1)), r)
+    return out
+
+def _build_boxfile(path, rn):
+    d = pd.read_csv(path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+    need = ["Jurisdiction", "OBS_VALUE"]
+    missing = [c for c in need if c not in d.columns]
+    if missing:
+        raise ValueError(f"The boxes file {os.path.basename(path)} has no column "
+                         + ", ".join(missing))
+    col = lambda c: d[c] if c in d.columns else pd.Series([""] * len(d), index=d.index)
+    ratings = None
+    rows, seen = [], Counter()
+    for _, x in pd.DataFrame({
+            "j": col("Jurisdiction"), "io": col("IMMEDIATE_OUTCOME"), "ind": col("Indicator"),
+            "lab": col("BOX_LABEL"), "num": col("BOX_NUMBER"), "tit": col("BOX_TITLE"),
+            "ch": col("MER_CHAPTER"), "p1": col("PDF_PAGE_START"), "p2": col("PDF_PAGE_END"),
+            "pdf": col("SOURCE_PDF"), "note": col("EXTRACTION_NOTE"), "ec": col("EFF_CAT"),
+            "el": col("Effectiveness rating"), "v": col("OBS_VALUE")}).iterrows():
+        j = x["j"].strip()
+        mm = re.search(r"IO\.?\s*(\d+)", x["io"])
+        ion = int(mm.group(1)) if mm else None
+        title = x["ind"].strip() or " ".join(t for t in (x["lab"], x["num"]) if t) + (
+            ". " + x["tit"] if x["tit"] else "")
+        rating = combine_rating(x["ec"], x["el"]) if x["ec"] else ""
+        if not rating and ion:
+            if ratings is None:
+                ratings = _io_ratings(rn)
+            rating = ratings.get((j, f"IO{ion}"), "")
+        register_labels([x["ec"]], [x["el"]])
+        p1, p2 = x["p1"].strip(), x["p2"].strip()
+        pages = (f"MER p. {p1}" if p1 and (not p2 or p2 == p1) else
+                 f"MER pp. {p1}\u2013{p2}" if p1 else "")
+        html = sanitize_html(x["v"]) or ("<p>" + html_escape(x["v"], quote=False) + "</p>")
+        seen[j] += 1
+        rows.append({
+            "Round": ROUND_LABEL[rn], "Jurisdiction": j,
+            "Table": "Effectiveness" if ion else "Other chapters",
+            "MEASURE": f"IO{ion}" if ion else "",
+            "Indicator": (f"IO.{ion} - {IO_NAMES.get(ion, '')}".rstrip(" -") if ion else
+                          f"MER chapter {x['ch']}" if x["ch"] else "Not linked to an IO"),
+            "Rating": rating or "NA", "Criteria rating": "NA",
+            "OBS_VALUE": strip_html(x["v"]), "OBS_HTML": html, "Lines": html_to_lines(html),
+            "BoxTitle": title[:240],
+            "BoxKind": "Case study" if _CASE_TITLE.search(x["lab"] + " " + title) else "Other box",
+            "CoreIssue": "", "BoxNo": seen[j],
+            "Source": x["pdf"].strip(), "Pages": pages, "Note": x["note"].strip()})
+    out = pd.DataFrame(rows, columns=UNIFORM_COLS + ["OBS_HTML"] + CASE_COLS)
+    out["_norm"] = [norm_text(t) for t in out["OBS_VALUE"].tolist()]
+    return out
+
+def case_source(rn):
+    """Where a round's case studies come from: the boxes file, or the text."""
+    path = box_file(rn)
+    return os.path.basename(path) if path else "MER text"
+
 def load_cases_round(rn):
+    path = box_file(rn)
+    if path:
+        sig = _file_sig(path)
+        hit = _CACHE.get("case" + rn)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+        cases = _build_boxfile(path, rn)
+        _CACHE["case" + rn] = (sig, cases)
+        return cases
     base = load_round(rn)
     hit = _CACHE.get("case" + rn)
     if hit is not None and hit[0] is base:
@@ -1339,7 +1439,7 @@ def _measure_key(m):
     """Natural sort: IO2 before IO10, R3 before R22."""
     return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', str(m))]
 
-_TABLE_ORDER = {t: i for i, t in enumerate(TABLES + ["General"])}
+_TABLE_ORDER = {t: i for i, t in enumerate(TABLES + ["General", "Other chapters"])}
 
 def citation(r):
     """'Austria, 5th round MER, IO.4 (rated ME)'"""
@@ -1362,6 +1462,8 @@ def citation(r):
         ref += f', criterion {r["Criteria rating"]}'
     if r.get("BoxTitle"):
         ref += f', {r["BoxTitle"][:120]}'
+    if r.get("Pages"):
+        ref += f' ({r["Pages"]})'
     return ref
 
 def row_id(r):
@@ -1674,7 +1776,7 @@ def _slim_row(r):
             "Criteria rating", "OBS_VALUE", "html", "context", "sentence", "matched",
             "variants", "ref", "File", "Location", "Sentence with term", "Details",
             "Full text", "KID", "Theme", "Outcome", "Plenary", "PlenaryLabel", "parts",
-            "matched_parts", "BoxTitle", "BoxKind", "CoreIssue")
+            "matched_parts", "BoxTitle", "BoxKind", "CoreIssue", "Source", "Pages", "Note")
     return {k: r[k] for k in keep if k in r}
 
 
@@ -2069,8 +2171,9 @@ def _kid_rows(ws, hr, b, sentence_only, idx):
     _add_table(ws, f"tTerm{idx}", hr, r - 1, len(heads))
 
 CASE_HEADERS = ["Round", "Reference (for citing)", "Jurisdiction", "IO", "Core issue",
-                "Indicator", "Rating", "Type", "Box title"]
-CASE_WIDTHS = [11, 40, 18, 8, 10, 34, 8, 12, 50]
+                "Indicator", "Rating", "Type", "Box title", "Source (MER PDF)", "Pages",
+                "Extraction note"]
+CASE_WIDTHS = [11, 40, 18, 8, 10, 34, 8, 12, 50, 24, 14, 30]
 
 def _case_rows(ws, hr, b, sentence_only, idx):
     """One row per box: where it comes from, then its full text."""
@@ -2081,7 +2184,8 @@ def _case_rows(ws, hr, b, sentence_only, idx):
     for x in b["results"]:
         _round_cell(ws.cell(row=r, column=1), x["Round"])
         vals = [x["ref"], x["Jurisdiction"], pretty_measure(x["MEASURE"]), x.get("CoreIssue", ""),
-                x["Indicator"], x["Rating"], x.get("BoxKind", ""), x.get("BoxTitle", "")]
+                x["Indicator"], x["Rating"], x.get("BoxKind", ""), x.get("BoxTitle", ""),
+                x.get("Source", ""), x.get("Pages", ""), x.get("Note", "")]
         for j, v in enumerate(vals, start=2):
             c = ws.cell(row=r, column=j)
             _setv(c, v)
@@ -2196,8 +2300,8 @@ def _write_all_hits(ws, p, blocks):
     is_case = p["data_mode"] == "CASE"
     if is_case:
         heads = ["Search term", "Round", "Reference (for citing)", "Jurisdiction", "IO",
-                 "Core issue", "Indicator", "Rating", "Type", "Box title", "Matched as"]
-        widths = [26, 11, 40, 18, 8, 10, 34, 8, 12, 50, 18]
+                 "Core issue", "Indicator", "Rating", "Type", "Box title", "Pages", "Matched as"]
+        widths = [26, 11, 40, 18, 8, 10, 34, 8, 12, 50, 14, 18]
     elif is_kid:
         heads = ["Search term", "Round", "KID", "Reference (for citing)", "Jurisdiction",
                  "IO / Recommendation", "Theme", "Plenary", "Plenary outcome",
@@ -2226,7 +2330,8 @@ def _write_all_hits(ws, p, blocks):
             if is_case:
                 vals = [b["term"], None, x["ref"], x["Jurisdiction"], pretty_measure(x["MEASURE"]),
                         x.get("CoreIssue", ""), x["Indicator"], x["Rating"], x.get("BoxKind", ""),
-                        x.get("BoxTitle", ""), ", ".join(v for v in (x.get("variants") or []) if v)]
+                        x.get("BoxTitle", ""), x.get("Pages", ""),
+                        ", ".join(v for v in (x.get("variants") or []) if v)]
             elif is_kid:
                 vals = [b["term"], None, kid_short(x["KID"]), x["ref"], x["Jurisdiction"],
                         x["Indicator"], x["Theme"], plenary_label(x["Plenary"]), x["Outcome"],
@@ -2501,7 +2606,7 @@ def _units(n, unit):
 
 def _case_word(x, lab, sentence_only):
     """One case study in the Word report: where it comes from, then the box."""
-    head = pretty_measure(x["MEASURE"])
+    head = pretty_measure(x["MEASURE"]) or x.get("Indicator", "")
     if x.get("CoreIssue"):
         head += "  ·  core issue " + x["CoreIssue"]
     if x.get("Rating") and x["Rating"] != "NA":
@@ -2520,6 +2625,9 @@ def _case_word(x, lab, sentence_only):
         for line in lines:
             out.append(_para(_highlight_runs(line, x.get("variants"), base_size="20"),
                              after=40, shade="F6EBE1"))
+    if x.get("Note"):
+        out.append(_para([_run("Extraction note: " + x["Note"], italic=True, size="16",
+                               color="A8873D")], after=20))
     out.append(_para([_run("Reference: " + x["ref"], italic=True, size="16", color="54677F")],
                      after=120))
     return out
@@ -2610,7 +2718,8 @@ def build_word_report(p, blocks, export_dir):
     elif is_mer:
         lab = labels[0]
         short = {"Effectiveness": "Effect.", "Risk and Context": "Risk & ctx",
-                 "Technical Compliance": "Tech. comp.", "General": "General"}
+                 "Technical Compliance": "Tech. comp.", "General": "General",
+                 "Other chapters": "Other ch."}
         rows = [[("Term", True), ("KIDs" if is_kid else "Mentions", True), ("Countries", True)]
                 + [(short[t], True) for t in tbls]]
         for b in blocks:
@@ -2668,7 +2777,8 @@ def build_word_report(p, blocks, export_dir):
             tname = {"Effectiveness": "In effectiveness " + ("KIDs" if is_kid else "chapters"),
                      "Risk and Context": "In risk and context",
                      "Technical Compliance": "In technical compliance" + (" KIDs" if is_kid else ""),
-                     "General": "In general KIDs (no IO or R)"}
+                     "General": "In general KIDs (no IO or R)",
+                     "Other chapters": "In other MER chapters (no IO)"}
             names = (["KIDs mentioning it" if is_kid else "Case studies" if is_case else "Mentions",
                       "Countries mentioning it"]
                      + [tname[t] for t in tbls]
@@ -2841,7 +2951,7 @@ def indicator_facet(df):
     """Indicators grouped by table, then by IO / recommendation."""
     u = df[df["Indicator"] != ""][["Table", "MEASURE", "Indicator"]].drop_duplicates()
     tree = []
-    for tbl in TABLES + ["General"]:
+    for tbl in TABLES + ["General", "Other chapters"]:
         part = u[u["Table"] == tbl]
         if part.empty:
             continue
@@ -2940,6 +3050,7 @@ def api_load():
             for r in rounds_of(p["round"]):
                 d = df[df["Round"] == ROUND_LABEL[r]]
                 per.append({"round": ROUND_LABEL[r], "rows": int(len(d)),
+                            "from": case_source(r),
                             "n_jurisdictions": int(d["Jurisdiction"].nunique()),
                             "counts": {{"Case study": "Case studies", "Other box": "Other boxes",
                                        TITLE_ONLY: "Title only, text missing in the data"}.get(k, k): int(v) for k, v in
@@ -3689,7 +3800,7 @@ li.hit .stepbody{background:color-mix(in srgb,var(--accent-soft) 45%,var(--surfa
         <button class="srcopt" data-v="KID" role="radio" onclick="setMode('KID')"><span class="radio"></span>
           <span><b>Key issues</b><span class="d">Key Issue Documents: what was debated at Plenary and what was decided</span></span></button>
         <button class="srcopt" data-v="CASE" role="radio" onclick="setMode('CASE')"><span class="radio"></span>
-          <span><b>Case studies</b><span class="d">The case study boxes in the MER effectiveness chapters, both rounds. Search words, or filter and list them all</span></span></button>
+          <span><b>Case studies</b><span class="d">The boxes and case studies in the MERs, both rounds. Search words, or filter and list them all</span></span></button>
         <button class="srcopt" data-v="OTHER" role="radio" onclick="setMode('OTHER')"><span class="radio"></span>
           <span><b>Other files</b><span class="d">Your own Word, PDF, Excel, CSV and text files</span></span></button>
       </div>
@@ -3870,7 +3981,7 @@ const RSHORT={'4th round':'4th','5th round':'5th'};
 const INTRO={
   MER:'Searches every paragraph of the mutual evaluation reports. Each hit opens to the paragraph as it appears in the report, tables and boxes included.',
   KID:'Searches the Key Issue Documents: the key issue, the ECG discussion and proposal, and the Plenary discussion and decision. Each hit is one KID, and opens to the full record.',
-  CASE:'Searches the case study boxes in the effectiveness chapters of the MERs. Type words to narrow them down, or leave the box empty and press Search to list every case study that matches your filters.',
+  CASE:'Searches the boxes and case studies in the MERs: the 4th round from the file of boxes extracted from the reports, the 5th round from the effectiveness text. Type words to narrow them down, or leave the box empty and press Search to list every one that matches your filters.',
   OTHER:'Searches your own files in the "other" folder, and shows exactly where each hit is.'};
 function welcomeHtml(){
   return '<div class="welcome"><h2>Your results will appear here</h2><p>'+INTRO[dataMode]+'</p>'
@@ -4151,7 +4262,7 @@ async function loadData(){
       const unit=j.unit==='KID'?'KIDs':j.unit==='CASE'?'boxes':'paragraphs';
       st.classList.add('ok');
       st.textContent=(j.file?'Loaded '+j.file+'\n':'')+j.rounds.map(r=>r.round+': '+r.rows.toLocaleString()+' '+unit+', '
-        +r.n_jurisdictions+' jurisdictions\n'
+        +r.n_jurisdictions+' jurisdictions'+(r.from?'\n  from '+r.from:'')+'\n'
         +Object.entries(r.counts).map(([k,v])=>'  '+k+': '+v.toLocaleString()).join('\n')).join('\n');
       LABELS=j.labels||{};
       const fx=j.facets||{
@@ -4340,7 +4451,7 @@ async function doSearch(){
   finally{stopProgress();spin(false);$('btnSearch').disabled=false;}
 }
 
-const SECS={'Effectiveness':'var(--eff)','Risk and Context':'var(--rc)','Technical Compliance':'var(--tc)','General':'var(--gen)'};
+const SECS={'Effectiveness':'var(--eff)','Risk and Context':'var(--rc)','Technical Compliance':'var(--tc)','General':'var(--gen)','Other chapters':'var(--gen)'};
 
 function covHtml(block,bi){
   const labs=block.rounds||[];if(!labs.length)return '';
@@ -4487,11 +4598,12 @@ function rowHtml(x,two,kind){
   if(kind==='CASE'){
     const io=(x.MEASURE||'').replace(/^IO(\d+).*/,'IO.$1');
     return '<tr class="hit'+cls+'" data-id="'+x._id+'">'+(two?'<td>'+rtag(x.Round)+'</td>':'')
-      +'<td class="jur">'+esc(x.Jurisdiction)+'</td>'
-      +'<td><b>'+esc(io)+(x.CoreIssue?', core issue '+esc(x.CoreIssue):'')+'</b><span class="smallmeta">'+esc(x.Indicator)+'</span></td>'
+      +'<td class="jur">'+esc(x.Jurisdiction)+(x.Pages?'<span class="smallmeta">'+esc(x.Pages)+'</span>':'')+'</td>'
+      +'<td><b>'+esc(io||x.Indicator)+(x.CoreIssue?', core issue '+esc(x.CoreIssue):'')+'</b>'+(io?'<span class="smallmeta">'+esc(x.Indicator)+'</span>':'')+'</td>'
       +'<td>'+(x.Rating==='NA'?'<span class="pill na">NA</span>':pill(x.Rating))+'</td>'
       +'<td class="ctx"><b>'+hl(x.BoxTitle||'',x.matched,x.variants)+'</b>'
       +(x.BoxKind&&x.BoxKind!=='Case study'?' <span class="fmt">'+esc(x.BoxKind)+'</span>':'')
+      +(x.Note?' <span class="fmt" title="Note from the extraction">'+esc(x.Note)+'</span>':'')
       +'<div>'+hl(x.matched?x.context:(x.context||'').replace(x.BoxTitle||'','').trim(),x.matched,x.variants)+'</div>'
       +'<div class="rowtools"><button class="readbtn" aria-expanded="false" onclick="toggleDoc(this,\''+x._id+'\')">Open case study</button></div></td>'
       +actions(x._id)+'</tr>';
@@ -4707,8 +4819,8 @@ def index():
 if __name__ == "__main__":
     os.makedirs(DEFAULT_EXPORT_DIR, exist_ok=True)
     threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
-    print(f"\n  MER Search Tool {VERSION} running at http://127.0.0.1:{PORT}")
-    print("  New: paragraphs shown with their tables and boxes | new filter panel")
+    print(f"\n  FATF Search Tool {VERSION} running at http://127.0.0.1:{PORT}")
+    print("  New: 4th round case studies from the extracted boxes file")
     print(f"  Data folder: {BASE_DIR}")
     print("  Keep this window open while using the tool. Press Ctrl+C to stop.\n")
     app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
